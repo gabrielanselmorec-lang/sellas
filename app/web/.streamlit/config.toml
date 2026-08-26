@@ -1,0 +1,10 @@
+[theme]
+base="light"
+primaryColor="#567052"
+backgroundColor="#fbf7ef"
+secondaryBackgroundColor="#fffaf2"
+textColor="#241a12"
+font="sans serif"
+
+[server]
+port=8510

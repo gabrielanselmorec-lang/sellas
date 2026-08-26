@@ -1,0 +1,24 @@
+# requirements.lock.txt
+#
+# Versões testadas e fixas para reprodução exata do ambiente.
+# Para regenerar este arquivo com o ambiente ativo, execute:
+#
+#   .venv\Scripts\pip.exe freeze > requirements.lock.txt
+#
+# Para instalar a partir deste arquivo:
+#
+#   .venv\Scripts\pip.exe install -r requirements.lock.txt
+#
+# ATENÇÃO: Este arquivo deve ser atualizado sempre que um pacote
+# for adicionado, removido ou atualizado após testes em produção.
+#
+# Versão do Python testada: 3.11+
+#
+# Para criar o venv do zero:
+#   python -m venv .venv
+#   .venv\Scripts\pip.exe install -r requirements.txt
+#   .venv\Scripts\pip.exe freeze > requirements.lock.txt
+#
+# -----------------------------------------------------------------
+# Preencher abaixo após rodar: .venv\Scripts\pip.exe freeze
+# -----------------------------------------------------------------

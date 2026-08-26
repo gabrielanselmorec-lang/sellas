@@ -1,0 +1,20 @@
+[theme]
+base="light"
+primaryColor="#567052"
+backgroundColor="#fbf7ef"
+secondaryBackgroundColor="#fffaf2"
+textColor="#241a12"
+font="sans serif"
+headingFont="sans-serif"
+headingFontSizes=["2rem", "1.6rem", "1.28rem", "1.1rem", "1rem", "0.92rem"]
+baseRadius="small"
+buttonRadius="small"
+borderColor="#bda985"
+dataframeBorderColor="#d7c6aa"
+dataframeHeaderBackgroundColor="#eee3d2"
+showWidgetBorder=true
+linkColor="#405f3d"
+linkUnderline=true
+
+[server]
+port=8510

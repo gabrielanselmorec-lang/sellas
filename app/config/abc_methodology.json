@@ -1,0 +1,47 @@
+{
+  "methodology_version": "abc-methodology-v3",
+  "normalization_version": "abc-normalization-v1",
+  "feature_version": "abc-features-v1",
+  "model_version": "logistic-l2-v1",
+  "interval_method": "wilson",
+  "interval_level": 0.95,
+  "beta_prior": {"alpha": 1.0, "beta": 1.0},
+  "minimum_chain_support": 8,
+  "cluster_uncertainty": {
+    "method": "cluster_bootstrap_by_session",
+    "level": 0.95,
+    "resamples": 2000,
+    "seed": 20260720
+  },
+  "drift": {
+    "method": "population_stability_index",
+    "stable_below": 0.1,
+    "material_at_or_above": 0.25
+  },
+  "operational_evaluation": {
+    "threshold": 0.5,
+    "threshold_rule": "configurado antes da validação final; não otimizado no teste"
+  },
+  "severity": {
+    "version": "abc-severity-v1",
+    "weights": {"C1": 0.2, "C2": 1.0},
+    "rationale": "Pesos internos configurados para sumarização exploratória; não constituem escala clínica validada."
+  },
+  "temporal_stability": {
+    "version": "abc-temporal-v2",
+    "max_gap_seconds": 300,
+    "minimum_occurrences": 3,
+    "minimum_sessions": 2,
+    "minimum_days": 2,
+    "require_same_session": true,
+    "require_same_environment": false
+  },
+  "evidence": {
+    "version": "abc-evidence-v1",
+    "minimum_sessions": 3,
+    "minimum_days": 3,
+    "missing_warning_ratio": 0.1,
+    "requires_temporal_validation_for_predictive": true,
+    "requires_calibration_for_predictive": true
+  }
+}

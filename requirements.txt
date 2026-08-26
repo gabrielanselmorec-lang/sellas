@@ -1,0 +1,23 @@
+fastapi
+uvicorn
+streamlit
+pandas
+plotly
+matplotlib
+openpyxl
+python-docx
+sqlalchemy
+requests
+reportlab
+scikit-learn
+scipy
+joblib
+google-genai
+google-generativeai
+cryptography
+cffi
+psycopg2-binary
+PyPDF2
+python-dotenv
+pydantic
+pywin32; platform_system == "Windows"

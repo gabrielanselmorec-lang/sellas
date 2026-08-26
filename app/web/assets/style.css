@@ -1,0 +1,818 @@
+/* Sellas Project dashboard theme */
+
+:root {
+    --sellas-bg: #fbf7ef;
+    --sellas-surface: #fffaf2;
+    --sellas-surface-muted: #f1e6d5;
+    --sellas-border: #d7c6aa;
+    --sellas-border-strong: #bda985;
+    --sellas-text: #241a12;
+    --sellas-muted: #5d4f40;
+    --sellas-primary: #6f8f68;
+    --sellas-primary-dark: #405f3d;
+    --sellas-accent: #a9645e;
+    --sellas-warning: #83551f;
+    --sellas-shadow: 0 18px 38px rgba(61, 43, 25, 0.10);
+    --sellas-shadow-soft: 0 8px 22px rgba(61, 43, 25, 0.08);
+}
+#MainMenu,
+footer,
+[data-testid="stStatusWidget"] {
+    visibility: hidden;
+}
+
+/* Keep Streamlit's header available because it owns the control that restores
+   the sidebar after it is collapsed. The header remains visually unobtrusive. */
+[data-testid="stHeader"] {
+    background: transparent !important;
+    visibility: visible !important;
+}
+
+body .stApp button[data-testid="stExpandSidebarButton"] {
+    background: var(--sellas-surface) !important;
+    border: 1px solid var(--sellas-border) !important;
+    border-radius: 8px !important;
+    box-shadow: var(--sellas-shadow-soft) !important;
+    color: var(--sellas-primary-dark) !important;
+    visibility: visible !important;
+    z-index: 1001 !important;
+}
+
+body .stApp button[data-testid="stExpandSidebarButton"] * {
+    color: var(--sellas-primary-dark) !important;
+    fill: var(--sellas-primary-dark) !important;
+    -webkit-text-fill-color: var(--sellas-primary-dark) !important;
+}
+
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+section.main,
+.main .block-container {
+    background: var(--sellas-bg) !important;
+    color: var(--sellas-text) !important;
+    font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.stApp *,
+[data-testid="stAppViewContainer"] * {
+    letter-spacing: 0 !important;
+}
+
+.block-container {
+    max-width: 1220px;
+    padding: 2.1rem 1.75rem 3rem;
+}
+
+.sellas-page-header {
+    align-items: center;
+    background: #fffaf2 !important;
+    border: 1px solid var(--sellas-border);
+    border-radius: 8px;
+    box-shadow: var(--sellas-shadow-soft);
+    display: flex;
+    justify-content: space-between;
+    margin: 0 0 1.35rem;
+    padding: 1.25rem 1.35rem;
+}
+
+.sellas-page-header,
+.sellas-page-header * {
+    color: var(--sellas-text) !important;
+}
+
+.sellas-page-header h1 {
+    color: var(--sellas-text);
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 2rem;
+    font-weight: 750;
+    letter-spacing: 0;
+    line-height: 1.15;
+    margin: 0;
+}
+
+.prediction-header {
+    background: linear-gradient(135deg, #fffaf2 0%, #efe2ce 100%) !important;
+}
+
+.prediction-header p {
+    color: var(--sellas-muted) !important;
+    font-size: 0.98rem;
+    margin: 0.45rem 0 0;
+}
+
+.sellas-eyebrow {
+    color: var(--sellas-primary-dark) !important;
+    display: block;
+    font-size: 0.76rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.28rem;
+    text-transform: uppercase;
+}
+
+.sellas-header-badge {
+    background: #f2e7d5;
+    border: 1px solid #dfc7a4;
+    border-radius: 999px;
+    color: #5c351d !important;
+    font-size: 0.84rem;
+    font-weight: 700;
+    padding: 0.42rem 0.78rem;
+    white-space: nowrap;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+    color: var(--sellas-text) !important;
+    font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+    letter-spacing: 0;
+}
+
+h2,
+h3 {
+    margin-top: 0.15rem;
+}
+
+p,
+li,
+label,
+.stMarkdown,
+[data-testid="stMarkdownContainer"],
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] span,
+[data-testid="stMarkdownContainer"] li {
+    color: var(--sellas-text) !important;
+}
+
+[data-testid="stSidebar"] {
+    background: #efe5d6 !important;
+    border-right: 1px solid var(--sellas-border);
+}
+
+/* Streamlit animates the collapsed sidebar with a translated element that
+   still receives an inline width. Explicitly release that flex space so the
+   main area cannot remain shifted or clipped after the animation. */
+[data-testid="stSidebar"][aria-expanded="false"] {
+    border-right: 0 !important;
+    flex: 0 0 0 !important;
+    max-width: 0 !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+    pointer-events: none !important;
+    visibility: hidden !important;
+    width: 0 !important;
+}
+
+[data-testid="stMain"] {
+    min-width: 0 !important;
+    width: 100% !important;
+}
+
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] p {
+    color: #241a12 !important;
+    font-weight: 650;
+}
+
+[data-testid="stSidebar"] hr {
+    border-color: var(--sellas-border);
+    margin: 1.25rem 0;
+}
+
+.stRadio div[role="radiogroup"] {
+    align-items: center;
+    border-bottom: 1px solid var(--sellas-border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin: 0.35rem 0 1rem;
+    padding-bottom: 0.65rem;
+}
+
+.stRadio label {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--sellas-text) !important;
+    min-height: 2.5rem;
+    padding: 0.45rem 0.75rem;
+    transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
+.stRadio div[role="radiogroup"] > label {
+    flex: 1 1 210px;
+    justify-content: center;
+}
+
+.stRadio label:hover {
+    background: #f1e6d5 !important;
+    border-color: #dfc7a4;
+}
+
+.stRadio label:has(input:checked) {
+    background: var(--sellas-surface) !important;
+    border-color: var(--sellas-border-strong);
+    box-shadow: inset 0 -2px 0 var(--sellas-accent);
+    color: var(--sellas-text) !important;
+}
+
+.stRadio label p,
+.stRadio label span {
+    color: var(--sellas-text) !important;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    background: transparent;
+    border-bottom: 1px solid var(--sellas-border);
+    gap: 0.35rem;
+    margin-bottom: 1rem;
+    padding: 0;
+}
+
+.stTabs [data-baseweb="tab"] {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px 8px 0 0;
+    color: var(--sellas-muted);
+    font-weight: 750;
+    min-height: 2.75rem;
+    padding: 0.65rem 1rem;
+    transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.stTabs [data-baseweb="tab"]:hover {
+    background: #f3e3cc;
+    border-color: #e8cfad;
+    color: var(--sellas-primary-dark);
+}
+
+.stTabs [aria-selected="true"] {
+    background: var(--sellas-surface);
+    border-color: var(--sellas-border);
+    border-bottom-color: var(--sellas-surface);
+    color: var(--sellas-primary-dark) !important;
+}
+
+.stTabs [data-baseweb="tab-panel"] {
+    background: var(--sellas-surface);
+    border: 1px solid var(--sellas-border);
+    border-radius: 8px;
+    box-shadow: var(--sellas-shadow);
+    padding: 1.25rem;
+}
+
+.stButton > button,
+.stDownloadButton > button,
+div[data-testid="stFormSubmitButton"] button,
+button[data-testid="stBaseButton-primaryFormSubmit"] {
+    background: var(--sellas-primary);
+    border: 1px solid var(--sellas-primary);
+    border-radius: 8px;
+    box-shadow: 0 5px 14px rgba(86, 112, 82, 0.18);
+    color: #fffaf2 !important;
+    font-weight: 750;
+    min-height: 2.45rem;
+    padding: 0.48rem 0.9rem;
+    transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.stButton > button *,
+.stDownloadButton > button *,
+div[data-testid="stFormSubmitButton"] button * {
+    color: #fffdf8 !important;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover,
+div[data-testid="stFormSubmitButton"] button:hover {
+    background: var(--sellas-primary-dark);
+    border-color: var(--sellas-primary-dark);
+    box-shadow: 0 8px 20px rgba(86, 112, 82, 0.24);
+    color: #fffdf8;
+    transform: translateY(-1px);
+}
+
+.stButton > button:focus,
+.stDownloadButton > button:focus,
+div[data-testid="stFormSubmitButton"] button:focus {
+    box-shadow: 0 0 0 3px rgba(183, 121, 76, 0.24);
+}
+
+.stSelectbox label,
+.stRadio label,
+.stDateInput label,
+.stTextInput label,
+.stTextArea label,
+.stNumberInput label,
+.stMultiSelect label {
+    color: var(--sellas-text) !important;
+    font-size: 0.9rem;
+    font-weight: 750;
+}
+
+.stTextInput input,
+.stTextArea textarea,
+.stNumberInput input,
+[data-baseweb="select"] > div,
+[data-baseweb="input"] > div,
+[data-testid="stDateInput"] input {
+    background: #fffaf2 !important;
+    border-color: var(--sellas-border) !important;
+    border-radius: 8px;
+    color: var(--sellas-text) !important;
+}
+
+.stTextInput input,
+.stTextArea textarea,
+.stNumberInput input {
+    -webkit-text-fill-color: var(--sellas-text);
+}
+
+[data-baseweb="select"] span,
+[data-baseweb="select"] input,
+[data-baseweb="input"] input,
+[data-testid="stDateInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"] textarea {
+    color: var(--sellas-text) !important;
+    -webkit-text-fill-color: var(--sellas-text) !important;
+}
+
+[data-baseweb="select"] svg,
+[data-testid="stDateInput"] svg {
+    color: var(--sellas-text) !important;
+    fill: var(--sellas-text) !important;
+}
+
+[data-testid="stSlider"] label,
+[data-testid="stSlider"] span,
+[data-testid="stSlider"] p,
+[data-testid="stSlider"] div {
+    color: var(--sellas-text) !important;
+}
+
+[data-testid="stSlider"] [role="slider"] {
+    background-color: var(--sellas-primary-dark) !important;
+    border-color: #fffaf2 !important;
+}
+
+[aria-disabled="true"],
+[data-disabled="true"],
+input:disabled,
+textarea:disabled {
+    color: #6b5843 !important;
+    opacity: 0.86 !important;
+    -webkit-text-fill-color: #6b5843 !important;
+}
+
+.stTextInput input:focus,
+.stTextArea textarea:focus,
+.stNumberInput input:focus,
+[data-baseweb="select"] > div:focus-within,
+[data-baseweb="input"] > div:focus-within {
+    border-color: var(--sellas-primary);
+    box-shadow: 0 0 0 3px rgba(183, 121, 76, 0.18);
+}
+
+[data-testid="stDataFrame"],
+[data-testid="stTable"],
+.stPlotlyChart {
+    background: var(--sellas-surface) !important;
+    border: 1px solid var(--sellas-border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.stPlotlyChart {
+    box-shadow: var(--sellas-shadow-soft);
+    padding: 0.65rem;
+}
+
+[data-testid="stMetric"] {
+    background: var(--sellas-surface) !important;
+    border: 1px solid var(--sellas-border);
+    border-radius: 8px;
+    box-shadow: var(--sellas-shadow-soft);
+    padding: 0.85rem 1rem;
+}
+
+.patient-strip {
+    align-items: center;
+    background: #fffaf2 !important;
+    border: 1px solid var(--sellas-border);
+    border-left: 5px solid var(--sellas-primary);
+    border-radius: 8px;
+    box-shadow: var(--sellas-shadow-soft);
+    display: flex;
+    gap: 0.85rem;
+    justify-content: space-between;
+    margin: 0.4rem 0 1.1rem;
+    padding: 0.8rem 1rem;
+}
+
+.patient-strip span,
+.patient-strip small {
+    color: var(--sellas-muted) !important;
+    font-size: 0.84rem;
+    font-weight: 750;
+}
+
+.patient-strip strong {
+    color: var(--sellas-text) !important;
+    flex: 1;
+    font-size: 1rem;
+}
+
+.analysis-card {
+    background: #fffaf2 !important;
+    border: 1px solid var(--sellas-border);
+    border-radius: 8px;
+    box-shadow: var(--sellas-shadow-soft);
+    min-height: 116px;
+    padding: 0.95rem 1rem;
+}
+
+.analysis-card,
+.analysis-card * {
+    color: var(--sellas-text) !important;
+}
+
+.analysis-card span {
+    color: var(--sellas-muted) !important;
+    display: block;
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.45rem;
+    text-transform: uppercase;
+}
+
+.analysis-card strong {
+    color: var(--sellas-text) !important;
+    display: block;
+    font-size: 1.55rem;
+    letter-spacing: 0;
+    line-height: 1.15;
+    margin-bottom: 0.42rem;
+}
+
+.analysis-card small {
+    color: var(--sellas-muted) !important;
+    display: block;
+    font-size: 0.82rem;
+    line-height: 1.3;
+}
+
+.formula-box {
+    background: #f8f1e5 !important;
+    border: 1px solid #d9c7a7;
+    border-left: 5px solid #d8bd72;
+    border-radius: 8px;
+    color: var(--sellas-text) !important;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 0.88rem;
+    line-height: 1.55;
+    margin: 1rem 0;
+    padding: 0.95rem 1rem;
+}
+
+.formula-box strong {
+    display: block;
+    font-family: "Inter", "Segoe UI", sans-serif;
+    font-size: 0.92rem;
+    margin-bottom: 0.45rem;
+}
+
+.analysis-table {
+    background: #fffaf2 !important;
+    border: 1px solid var(--sellas-border);
+    border-collapse: separate;
+    border-radius: 8px;
+    border-spacing: 0;
+    box-shadow: var(--sellas-shadow-soft);
+    margin: 0.75rem 0 1.2rem;
+    overflow: hidden;
+    width: 100%;
+}
+
+.analysis-table th {
+    background: #eee3d2;
+    border-bottom: 1px solid var(--sellas-border);
+    color: var(--sellas-text) !important;
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    padding: 0.65rem 0.75rem;
+    text-align: left;
+    text-transform: uppercase;
+}
+
+.analysis-table td {
+    border-bottom: 1px solid #eadfce;
+    color: var(--sellas-text) !important;
+    font-size: 0.86rem;
+    line-height: 1.35;
+    max-width: 420px;
+    padding: 0.65rem 0.75rem;
+    vertical-align: top;
+}
+
+.analysis-table tr:last-child td {
+    border-bottom: 0;
+}
+
+.analysis-table tr:nth-child(even) td {
+    background: #fbf6ed;
+}
+
+[data-testid="stMetricLabel"] {
+    color: var(--sellas-muted);
+    font-weight: 700;
+}
+
+[data-testid="stAlert"] {
+    border-radius: 8px;
+    border-width: 1px;
+}
+
+hr {
+    border: 0;
+    border-top: 1px solid var(--sellas-border);
+    margin: 1.25rem 0;
+}
+
+div[data-testid="stExpander"] {
+    background: var(--sellas-surface);
+    border: 1px solid var(--sellas-border);
+    border-radius: 8px;
+    box-shadow: var(--sellas-shadow-soft);
+    overflow: hidden;
+}
+
+div[data-testid="stExpander"] details summary {
+    font-weight: 750;
+}
+
+/* Final contrast lock: Streamlit/BaseWeb inject dynamic classes after theme setup. */
+html,
+body,
+.stApp,
+.stApp > div,
+[data-testid="stAppViewContainer"],
+[data-testid="stAppViewContainer"] > .main,
+[data-testid="stMain"],
+[data-testid="stMainBlockContainer"] {
+    background-color: var(--sellas-bg) !important;
+    color: var(--sellas-text) !important;
+}
+
+.stApp h1,
+.stApp h2,
+.stApp h3,
+.stApp h4,
+.stApp h5,
+.stApp h6,
+.stApp p,
+.stApp label,
+.stApp li,
+.stApp small,
+.stApp strong,
+.stApp [data-testid="stMarkdownContainer"],
+.stApp [data-testid="stMarkdownContainer"] * {
+    color: var(--sellas-text) !important;
+}
+
+.stCaptionContainer,
+.stCaptionContainer *,
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] * {
+    color: var(--sellas-muted) !important;
+}
+
+.sellas-page-header,
+.patient-strip,
+.analysis-card,
+.formula-box,
+.analysis-table,
+.stPlotlyChart,
+[data-testid="stMetric"],
+div[data-testid="stExpander"] {
+    background-color: var(--sellas-surface) !important;
+    color: var(--sellas-text) !important;
+}
+
+.sellas-page-header *,
+.patient-strip *,
+.analysis-card *,
+.formula-box *,
+.analysis-table * {
+    color: var(--sellas-text) !important;
+}
+
+.analysis-card span,
+.analysis-card small,
+.patient-strip span,
+.patient-strip small,
+.prediction-header p {
+    color: var(--sellas-muted) !important;
+}
+
+[data-baseweb="select"] > div,
+[data-baseweb="input"] > div,
+[data-testid="stDateInput"] input,
+[data-testid="stTimeInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input {
+    background-color: #fffaf2 !important;
+    border-color: var(--sellas-border-strong) !important;
+    color: var(--sellas-text) !important;
+}
+
+[data-baseweb="select"] *,
+[data-baseweb="input"] *,
+[data-testid="stDateInput"] *,
+[data-testid="stTimeInput"] *,
+[data-testid="stNumberInput"] *,
+[data-testid="stTextInput"] * {
+    color: var(--sellas-text) !important;
+    -webkit-text-fill-color: var(--sellas-text) !important;
+}
+
+[data-testid="stForm"] {
+    background: #fffaf2 !important;
+    border: 1px solid var(--sellas-border) !important;
+    border-radius: 8px !important;
+    box-shadow: var(--sellas-shadow-soft);
+    margin: 0.8rem 0 1.2rem;
+    padding: 1rem !important;
+}
+
+.stButton > button,
+.stDownloadButton > button,
+div[data-testid="stFormSubmitButton"] button {
+    background-color: var(--sellas-primary-dark) !important;
+    border-color: var(--sellas-primary-dark) !important;
+}
+
+.stButton > button,
+.stButton > button *,
+.stDownloadButton > button,
+.stDownloadButton > button *,
+div[data-testid="stFormSubmitButton"] button,
+div[data-testid="stFormSubmitButton"] button *,
+button[data-testid="stBaseButton-primaryFormSubmit"],
+button[data-testid="stBaseButton-primaryFormSubmit"] * {
+    color: #fffaf2 !important;
+    -webkit-text-fill-color: #fffaf2 !important;
+}
+
+div[data-testid="stFormSubmitButton"],
+div[data-testid="stFormSubmitButton"] > div,
+div[data-testid="stFormSubmitButton"] button {
+    opacity: 1 !important;
+    width: 100% !important;
+}
+
+/* Streamlit 1.5x button variants need direct selectors to keep text visible. */
+.stApp button[data-testid^="stBaseButton-"],
+.stApp [data-testid="stDownloadButton"] button,
+.stApp [data-testid="stFormSubmitButton"] button {
+    background: #405f3d !important;
+    background-color: #405f3d !important;
+    border: 1px solid #405f3d !important;
+    box-shadow: 0 6px 16px rgba(64, 95, 61, 0.22) !important;
+    color: #fffdf8 !important;
+    cursor: pointer !important;
+    min-height: 2.75rem !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+.stApp button[data-testid^="stBaseButton-"] *,
+.stApp [data-testid="stDownloadButton"] button *,
+.stApp [data-testid="stFormSubmitButton"] button * {
+    color: #fffdf8 !important;
+    fill: #fffdf8 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    -webkit-text-fill-color: #fffdf8 !important;
+}
+
+.stApp button[data-testid^="stBaseButton-"]:hover,
+.stApp [data-testid="stDownloadButton"] button:hover,
+.stApp [data-testid="stFormSubmitButton"] button:hover {
+    background-color: #2f4e37 !important;
+    border-color: #2f4e37 !important;
+    transform: translateY(-1px);
+}
+
+.stApp button[data-testid^="stBaseButton-"]:disabled {
+    background-color: #9aa798 !important;
+    border-color: #899687 !important;
+    cursor: not-allowed !important;
+    opacity: 0.72 !important;
+}
+
+[data-testid="stTimeInput"] input {
+    font-variant-numeric: tabular-nums;
+}
+
+.stRadio label,
+.stRadio label *,
+[data-testid="stSlider"],
+[data-testid="stSlider"] * {
+    color: var(--sellas-text) !important;
+}
+
+@media (max-width: 900px) {
+    .block-container {
+        padding: 1rem 1rem 2rem;
+    }
+
+    .sellas-page-header {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.8rem;
+        padding: 1rem;
+    }
+
+    .sellas-page-header h1 {
+        font-size: 1.45rem;
+    }
+
+    .sellas-header-badge {
+        white-space: normal;
+    }
+
+    .patient-strip {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+
+    .stTabs [data-baseweb="tab-list"] {
+        overflow-x: auto;
+    }
+
+    .stTabs [data-baseweb="tab-panel"] {
+        padding: 0.9rem;
+    }
+}
+
+@media print {
+    [data-testid="stSidebar"],
+    [data-testid="stHeader"],
+    [data-testid="stToolbar"],
+    [data-testid="stDownloadButton"],
+    button,
+    .no-print {
+        display: none !important;
+    }
+
+    .print-only {
+        display: block !important;
+    }
+
+    body,
+    .stApp,
+    .main,
+    .block-container {
+        background: #fff !important;
+        color: #000 !important;
+    }
+
+    .block-container {
+        max-width: none !important;
+        padding: 0 !important;
+    }
+
+    .page-break {
+        break-before: page;
+    }
+
+    .avoid-break,
+    table,
+    tr,
+    img,
+    canvas,
+    [data-testid="stPlotlyChart"] {
+        break-inside: avoid;
+    }
+
+    table {
+        width: 100% !important;
+        border-collapse: collapse !important;
+    }
+
+    thead {
+        display: table-header-group;
+    }
+}

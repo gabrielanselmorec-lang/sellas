@@ -1,0 +1,44 @@
+{
+  "patientName": "PACIENTE QA",
+  "generatedAt": "2026-07-14T12:00:00-03:00",
+  "activeRecords": [
+    {
+      "intervalo_id": "qa-interval-1",
+      "data_hora": "2026-07-14T10:21:06-03:00",
+      "ambiente": "Sala de terapia",
+      "antecedente": "Demanda apresentada",
+      "comportamento": "Agressão física",
+      "classificacao_rotulo": "C2 - intenso",
+      "funcao": "Fuga ou esquiva",
+      "causou_lesao": true,
+      "houve_sangramento": false,
+      "direcionado_ponto_vital": false,
+      "indice_perigo": 1.0,
+      "consequencia": "Pausa"
+    }
+  ],
+  "actionLogs": [
+    {
+      "criado_em": "2026-07-14T10:22:00-03:00",
+      "acao": "registro_editado",
+      "intervalo_id": "qa-interval-1",
+      "snapshot": {
+        "data_hora": "2026-07-14T10:21:06-03:00",
+        "ambiente": "Sala de terapia",
+        "antecedente": "Demanda apresentada",
+        "comportamento": "Agressão física",
+        "classificacao_rotulo": "C2 - intenso",
+        "funcao": "Fuga ou esquiva",
+        "causou_lesao": true,
+        "houve_sangramento": false,
+        "direcionado_ponto_vital": false,
+        "consequencia": "Pausa",
+        "anterior": {
+          "classificacao_rotulo": "C1 - leve",
+          "funcao": "Indeterminada / em avaliação"
+        }
+      }
+    }
+  ],
+  "categories": []
+}
