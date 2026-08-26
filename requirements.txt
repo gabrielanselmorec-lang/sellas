@@ -20,4 +20,5 @@ psycopg2-binary
 PyPDF2
 python-dotenv
 pydantic
+alembic
 pywin32; platform_system == "Windows"
