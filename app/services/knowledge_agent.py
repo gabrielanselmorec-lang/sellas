@@ -301,6 +301,10 @@ def _summarize_patient_context(patient_context: dict[str, Any]) -> str:
     targets = patient_context.get("alvos") or []
     behaviors = patient_context.get("interferentes") or []
     lines = ["Dados clinicos do paciente:"]
+    if patient_context.get("abc_sellas") is not None:
+        abc = patient_context["abc_sellas"]
+        lines.append("ABCs registrados no Sellas (fonte independente dos demais registros):")
+        lines.append(json.dumps({key:abc.get(key) for key in ("total_registros", "distribuicao_temporal", "por_ambiente", "por_classificacao", "por_funcao", "aviso")}, ensure_ascii=False, default=str))
     if programs:
         lines.append("Programas:")
         for item in programs[:25]:
@@ -1019,6 +1023,7 @@ def _format_abc_functional_context(
             "comportamentos_distintos": analysis.get("comportamentos_distintos", 0),
             "ambientes_distintos": analysis.get("ambientes_distintos", 0),
             "c1_leve": analysis.get("c1_leve", 0),
+            "c1_por_regra": analysis.get("c1_por_regra",0),
             "c2_intenso": analysis.get("c2_intenso", 0),
             "nao_classificados": analysis.get("nao_classificados", 0),
         },
@@ -1030,9 +1035,13 @@ def _format_abc_functional_context(
         "associacoes_comportamento_consequencia": list(
             analysis.get("comportamento_consequencia") or []
         )[:8],
+        "distribuicao_temporal_completa": analysis.get("distribuicao_temporal") or {},
         "distribuicao_ambientes": list(analysis.get("por_ambiente") or [])[:10],
         "distribuicao_funcoes_informadas": list(analysis.get("por_funcao") or [])[:10],
-        "ultimos_registros_desidentificados": list(analysis.get("registros_recentes") or [])[:20],
+        "ultimos_registros_desidentificados": [
+            {key:row.get(key) for key in ("data", "hora", "precisao_horario", "ambiente", "antecedente", "comportamento", "consequencia", "classificacao", "classificacao_assumida", "funcao", "frequencia")}
+            for row in list(analysis.get("registros_recentes") or [])[:20]
+        ],
         "limite_estatistico": analysis.get(
             "aviso",
             "Associacoes descritivas nao confirmam causa nem funcao comportamental.",

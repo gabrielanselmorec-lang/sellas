@@ -1,6 +1,16 @@
 import app.services.knowledge_agent as knowledge_agent
 
 
+def test_abc_ai_context_does_not_include_transcription_identifiers():
+    analysis=_analysis_fixture()
+    analysis["registros_recentes"][0].update({"observador":"IDENTIFICADOR_PRIVADO",
+        "fonte_referencia":"FOLHA_PRIVADA", "atendimento_referencia":"ATENDIMENTO_PRIVADO"})
+    context=knowledge_agent._format_abc_functional_context(analysis,selected_chain=None,selected_environment=None)
+    assert "IDENTIFICADOR_PRIVADO" not in context
+    assert "FOLHA_PRIVADA" not in context
+    assert "ATENDIMENTO_PRIVADO" not in context
+
+
 def _analysis_fixture():
     chain = "Demanda -> Choro -> Pausa"
     return {

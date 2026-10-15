@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from app.services.abc_closed import _is_transient_database_error
+from app.services.abc_integrity import record_metadata
 from app.services.abc_methodology import deterministic_transition_id
 
 
@@ -570,7 +571,9 @@ def load_chain_episodes(engine, patient_token: str) -> list[dict[str, Any]]:
         rows = conn.execute(
             text(
                 """
-                SELECT i.id AS interval_id, i.sessao_id AS session_id, s.service_id,
+                SELECT i.id AS interval_id, i.metadados,
+                       BOOL_OR(e.fonte IN ('registro_fechado','episodio_manual')) AS registro_fechado,
+                       i.sessao_id AS session_id, s.service_id,
                        s.patient_token, s.ambiente AS environment, s.timezone,
                        s.observacao_completa AS session_observation_complete,
                        i.inicio AS start_ts, i.fim AS end_ts, i.status_observacao AS status,
@@ -611,6 +614,10 @@ def load_chain_episodes(engine, patient_token: str) -> list[dict[str, Any]]:
     result = []
     for row in rows:
         item = dict(row)
+        item.update(record_metadata(item))
+        # Um horário de episódio não mede início de A e término de C.
+        if item["record_kind"] == "episode":
+            continue
         item["antecedent_occurred"] = True if item.get("antecedent_event_id") else None
         for key in ("interval_id", "session_id", "service_id", "patient_token", "antecedent_event_id", "behavior_event_id", "consequence_event_id"):
             if item.get(key) is not None:
@@ -797,8 +804,14 @@ def list_chain_candidates(
         rows = conn.execute(
             text(
                 f"""
-                SELECT * FROM abc_chain_candidates
-                WHERE patient_token = CAST(:patient_token AS UUID) {status_sql}
+                SELECT * FROM abc_chain_candidates candidate
+                WHERE EXISTS (SELECT 1 FROM abc_intervals i WHERE i.id=candidate.from_interval_id
+                    AND COALESCE(i.metadados->>'record_kind','observation') <> 'episode'
+                    AND NOT EXISTS(SELECT 1 FROM abc_interval_events e WHERE e.intervalo_id=i.id AND e.fonte='registro_fechado'))
+                  AND EXISTS (SELECT 1 FROM abc_intervals i WHERE i.id=candidate.to_interval_id
+                    AND COALESCE(i.metadados->>'record_kind','observation') <> 'episode'
+                    AND NOT EXISTS(SELECT 1 FROM abc_interval_events e WHERE e.intervalo_id=i.id AND e.fonte='registro_fechado'))
+                  AND patient_token = CAST(:patient_token AS UUID) {status_sql}
                 ORDER BY completed_at DESC
                 """
             ),
@@ -965,19 +978,10 @@ def approve_current_chain_candidates(
 
 
 def list_chain_stats(engine, *, patient_token: str) -> list[dict[str, Any]]:
-    init_abc_chain_tables(engine)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT * FROM abc_chain_stats
-                WHERE patient_token = CAST(:patient_token AS UUID)
-                ORDER BY insufficient_sample, lift DESC NULLS LAST, n_chain_behavior DESC
-                """
-            ),
-            {"patient_token": patient_token},
-        ).mappings().all()
-    return [_serialize(row) for row in rows]
+    episodes = load_chain_episodes(engine, patient_token)
+    candidates = list_chain_candidates(engine, patient_token=patient_token)
+    config = get_active_chain_config(engine)["config"]
+    return calculate_chain_statistics(episodes, candidates, config)
 
 
 def build_transition_matrix(engine, *, patient_token: str) -> list[dict[str, Any]]:

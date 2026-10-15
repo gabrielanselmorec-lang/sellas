@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-15
+
+- Reorganizada a área ABC nas abas Horários, Evolução, Contextos, Cadeias, Registros e Relatórios.
+- Destacadas faixas de uma hora, empates, percentuais e dias com registros, com detalhe por faixa e opções de 30 e 15 minutos.
+- Separados episódios, respostas e tempo real de observação, preservando horários desconhecidos e a precisão da fonte.
+- Acrescentados controle de reenvios, conferência de possíveis duplicações e metadados da coleta.
+- Aplicado o mesmo recorte às cadeias, aos indicadores, aos relatórios e às respostas calculadas sobre horários.
+- Preservada a origem auditável da política de C1 para classificação não informada.
+- Adicionados testes de integridade, filtros, faixas de horário, interface e persistência opcional em PostgreSQL.
+
 ## ABC methodology v3 — 20/07/2026
 
 - Acrescenta auditoria de qualidade e rastreabilidade, exposição por hora e IC agrupado por sessão.

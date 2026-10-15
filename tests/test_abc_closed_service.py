@@ -309,10 +309,11 @@ def test_printable_summary_anonymizes_and_excludes_rejected_or_unreviewed_chains
     intervals = [
         {"intervalo_id": "i1", "session_id": "s1", "status_observacao": "observed", "duracao_planejada_minutos": 5, "instrumento_versao": "1"}
     ]
+    intervals.append({**intervals[0], "intervalo_id": "i2"})
     candidates = [
-        {"origin_behavior_code": "B1", "from_consequence_code": "C1", "to_antecedent_code": "A2", "next_behavior_code": "B2", "delta_seconds": 30, "chain_confidence": 0.95, "validation_status": "accepted"},
-        {"origin_behavior_code": "B3", "from_consequence_code": "C3", "to_antecedent_code": "A4", "next_behavior_code": "B4", "delta_seconds": 60, "chain_confidence": 0.80, "validation_status": "candidate"},
-        {"origin_behavior_code": "B5", "from_consequence_code": "C5", "to_antecedent_code": "A6", "next_behavior_code": "B6", "delta_seconds": 90, "chain_confidence": 0.90, "validation_status": "rejected"},
+        {"from_interval_id": "i1", "to_interval_id": "i2", "origin_behavior_code": "B1", "from_consequence_code": "C1", "to_antecedent_code": "A2", "next_behavior_code": "B2", "delta_seconds": 30, "chain_confidence": 0.95, "validation_status": "accepted"},
+        {"from_interval_id": "i1", "to_interval_id": "i2", "origin_behavior_code": "B3", "from_consequence_code": "C3", "to_antecedent_code": "A4", "next_behavior_code": "B4", "delta_seconds": 60, "chain_confidence": 0.80, "validation_status": "candidate"},
+        {"from_interval_id": "i1", "to_interval_id": "i2", "origin_behavior_code": "B5", "from_consequence_code": "C5", "to_antecedent_code": "A6", "next_behavior_code": "B6", "delta_seconds": 90, "chain_confidence": 0.90, "validation_status": "rejected"},
     ]
 
     result = build_abc_printable_summary(

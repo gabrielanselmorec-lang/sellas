@@ -17,6 +17,8 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
+
+from app.services.abc_integrity import has_behavior, local_timestamp
 from scipy.stats import beta as beta_distribution
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
@@ -866,6 +868,9 @@ def audit_abc_data_quality(
     invalid_timestamps = 0
     missing_timestamps = 0
     for item in record_rows:
+        if item.get("precisao_horario") == "unknown":
+            missing_timestamps += 1
+            continue
         value = first_value(item, ("data_hora", "timestamp", "start_ts", "onset_ts"))
         if value in (None, ""):
             missing_timestamps += 1
@@ -879,8 +884,10 @@ def audit_abc_data_quality(
     overlap_evaluable = False
     grouped_intervals: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
     for item in interval_rows:
-        start = first_value(item, ("start_ts", "onset_ts", "inicio_ts", "data_hora_inicio"))
-        end = first_value(item, ("end_ts", "offset_ts", "fim_ts", "data_hora_fim"))
+        if item.get("record_kind") == "episode":
+            continue
+        start = first_value(item, ("start_ts", "onset_ts", "inicio_ts", "data_hora_inicio", "inicio"))
+        end = first_value(item, ("end_ts", "offset_ts", "fim_ts", "data_hora_fim", "fim"))
         session = first_value(item, ("session_id", "sessao_id"))
         if not start or not end or not session:
             continue
@@ -945,91 +952,81 @@ def audit_abc_data_quality(
     }
 
 
-def compute_exposure_summary(
-    records: Iterable[dict[str, Any]],
-    intervals: Iterable[dict[str, Any]],
-) -> dict[str, Any]:
-    """Calcula taxas somente com tempo explicitamente observado; nunca inventa exposição ausente."""
-    records_rows = [dict(item) for item in records]
-    interval_rows = [dict(item) for item in intervals]
-    record_by_interval = {
-        str(item.get("intervalo_id") or item.get("interval_id")): item
-        for item in records_rows
-        if item.get("intervalo_id") or item.get("interval_id")
-    }
-    occurrence_ids = set(record_by_interval)
-    total_minutes = 0.0
-    observed_ids: set[str] = set()
-    by_environment: dict[str, dict[str, float]] = {}
-    by_date: dict[str, dict[str, Any]] = {}
-    for item in interval_rows:
-        if str(item.get("status_observacao") or "") != "observed":
+def compute_exposure_summary(records, intervals) -> dict[str, Any]:
+    """Usa somente janelas de observação reais; episódios não criam exposição."""
+    rows = [dict(row) for row in records if has_behavior(row)]
+    windows = []
+    for raw in intervals:
+        item = dict(raw)
+        if item.get("record_kind") == "episode" or item.get("status_observacao") != "observed" or item.get("observacao_completa") is False:
             continue
+        start, end = item.get("inicio") or item.get("start_ts"), item.get("fim") or item.get("end_ts")
+        if start and end:
+            start, end = local_timestamp(start), local_timestamp(end)
+            minutes = (end-start).total_seconds()/60
+        else:
+            start = end = None
+            minutes = float(item.get("duracao_planejada_minutos") or item.get("duration_minutes") or 0)
+        if minutes > 0:
+            windows.append((item, start, end, minutes))
+    unplaced = sum(1 for row in rows if row.get("precisao_horario") == "unknown" and any(
+        start and local_timestamp(row["data_hora"]).date() == start.date()
+        and (not item.get("ambiente") or item.get("ambiente") == row.get("ambiente"))
+        for item, start, _, _ in windows))
+    ordered = sorted((start, end) for _, start, end, _ in windows if start and end)
+    overlap = any(start < previous_end for (_, previous_end), (start, _) in zip(ordered, ordered[1:]))
+    rate_unavailable = overlap or bool(unplaced)
+    observed_minutes = sum(minutes for _, _, _, minutes in windows)
+    seen = set()
+    by_environment, by_date = {}, {}
+    occurrence_windows = 0
+    for item, start, end, minutes in windows:
         interval_id = str(item.get("intervalo_id") or item.get("interval_id") or "")
-        duration = float(item.get("duracao_planejada_minutos") or item.get("duration_minutes") or 0)
-        if duration <= 0:
-            continue
-        total_minutes += duration
-        if interval_id:
-            observed_ids.add(interval_id)
-        record = record_by_interval.get(interval_id, {})
-        environment = str(item.get("ambiente") or item.get("environment") or record.get("ambiente") or record.get("environment") or "Não informado")
-        timestamp = item.get("start_ts") or item.get("onset_ts") or item.get("data_hora_inicio") or record.get("data_hora") or record.get("timestamp")
-        date_label = "Não informado"
-        if timestamp:
-            try:
-                date_label = pd.to_datetime(timestamp, errors="raise").strftime("%Y-%m-%d")
-            except Exception:
-                pass
-        env = by_environment.setdefault(environment, {"observed_minutes": 0.0, "occurrence_intervals": 0.0})
-        env["observed_minutes"] += duration
-        day = by_date.setdefault(date_label, {"observed_minutes": 0.0, "occurrence_intervals": 0, "behaviors": Counter()})
-        day["observed_minutes"] += duration
-        if interval_id in occurrence_ids:
-            env["occurrence_intervals"] += 1
-            day["occurrence_intervals"] += 1
-            behavior = str(record.get("comportamento") or "Não informado")
-            day["behaviors"][behavior] += 1
-    observed_hours = total_minutes / 60
-    occurrence_observed = len(observed_ids & occurrence_ids)
-    for item in by_environment.values():
-        hours = item["observed_minutes"] / 60
-        item["observed_hours"] = hours
-        item["occurrences_per_hour"] = item["occurrence_intervals"] / hours if hours else None
-    serial_days = []
-    for date_label, item in sorted(by_date.items()):
-        hours = item["observed_minutes"] / 60
-        serial_days.append(
-            {
-                "date": date_label,
-                "observed_hours": hours,
-                "occurrence_intervals": item["occurrence_intervals"],
-                "occurrences_per_hour": item["occurrence_intervals"] / hours if hours else None,
-                "behavior_counts": dict(item["behaviors"]),
-                "behavior_rates_per_hour": {
-                    behavior: count / hours for behavior, count in item["behaviors"].items()
-                } if hours else {},
-            }
-        )
-    return {
-        "status": "calculable" if observed_hours > 0 else "unavailable",
-        "observed_hours": observed_hours,
-        "observed_intervals_with_duration": len(observed_ids),
-        "occurrence_intervals": occurrence_observed,
-        "opportunities_without_occurrence": max(0, len(observed_ids) - occurrence_observed),
-        "occurrences_per_hour": occurrence_observed / observed_hours if observed_hours else None,
-        "by_environment": by_environment,
-        "by_date": serial_days,
-        "warning": (
-            "Taxas por hora usam somente intervalos explicitamente observados e com duração positiva."
-            if observed_hours
-            else "Exposição temporal indisponível; contagens não foram convertidas em taxas."
-        ),
-        "unavailable_denominators": [
-            "tempo em demanda",
-            "tempo em transição",
-        ],
-    }
+        environment = item.get("ambiente") or item.get("environment")
+        matches = []
+        for index, row in enumerate(rows):
+            identifier = str(row.get("intervalo_id") or row.get("interval_id") or index)
+            if identifier in seen:
+                continue
+            direct = identifier == interval_id
+            in_window = False
+            if start and end and row.get("precisao_horario") != "unknown" and row.get("data_hora"):
+                stamp = local_timestamp(row["data_hora"])
+                in_window = start <= stamp < end and (not environment or row.get("ambiente") == environment)
+            if direct or in_window:
+                matches.append(row)
+                seen.add(identifier)
+        occurrence_windows += bool(matches)
+        env_label = str(environment or (matches[0].get("ambiente") if matches else None) or "Não informado")
+        day_label = start.date().isoformat() if start else (str(matches[0].get("data_hora"))[:10] if matches else "Não informado")
+        for group, label in ((by_environment, env_label), (by_date, day_label)):
+            target = group.setdefault(label, {"observed_minutes": 0.0, "occurrence_intervals": 0, "episodes": 0, "responses": 0, "behaviors": Counter()})
+            target["observed_minutes"] += minutes
+            target["occurrence_intervals"] += bool(matches)
+            target["episodes"] += len(matches)
+            target["responses"] += sum(int(r.get("frequencia") or 1) for r in matches)
+            target["behaviors"].update(r["comportamento"] for r in matches)
+    hours = observed_minutes/60
+    for group in (by_environment, by_date):
+        for value in group.values():
+            value["observed_hours"] = value["observed_minutes"]/60
+            value["occurrences_per_hour"] = value["episodes"]/value["observed_hours"] if not rate_unavailable else None
+            value["behavior_counts"] = dict(value.pop("behaviors"))
+            value["behavior_rates_per_hour"] = {name:count/value["observed_hours"] for name,count in value["behavior_counts"].items()} if not rate_unavailable else {}
+    return {"status": "unavailable" if not hours or rate_unavailable else "calculable",
+            "observed_hours": hours if hours and not rate_unavailable else None,
+            "observed_intervals_with_duration": len(windows),
+            "occurrence_intervals": occurrence_windows,
+            "episodes_in_observed_time": len(seen),
+            "opportunities_without_occurrence": max(0,len(windows)-occurrence_windows) if not rate_unavailable else None,
+            "occurrences_per_hour": len(seen)/hours if hours and not rate_unavailable else None,
+            "by_environment": by_environment,
+            "by_date": [{"date":day,**values} for day,values in sorted(by_date.items())],
+            "warning": ("Janelas de observação sobrepostas: corrija os períodos antes de calcular taxas." if overlap else "Há episódios sem horário neste dia e ambiente; complete os horários antes de calcular taxas ou ausência." if unplaced else
+                "Taxas usam apenas janelas de observação reais e completas. Episódios fora dessas janelas não entram no numerador." if hours else
+                "Tempo real de observação não informado; taxas por hora e ausência observada indisponíveis."),
+            "unplaced_episodes": unplaced,
+            "unavailable_denominators": ["tempo em demanda", "tempo em transição"]}
 
 
 def compute_drift_report(

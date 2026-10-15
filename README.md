@@ -7,6 +7,8 @@ Plataforma experimental para **registro, análise e documentação de dados em A
 ## Principais recursos
 
 - registro ABC com data, horário, ambiente, antecedente, comportamento, consequência, intensidade e hipótese funcional;
+- distribuição por faixas de horário, com destaque dos maiores totais e detalhe por comportamento, ambiente e dia;
+- navegação ABC em abas, com filtros compartilhados entre gráficos, análises e relatórios;
 - classificação de comportamentos interferentes em C1 e C2, com critérios observáveis de risco;
 - histórico completo, edição auditável e ordenação pelos registros adicionados mais recentemente;
 - análise descritiva de frequências, ambientes, funções e cadeias A-B-C;
@@ -17,6 +19,8 @@ Plataforma experimental para **registro, análise e documentação de dados em A
 - base para integração com bHave;
 - experimentos de previsão comportamental com métricas, abstenção e acompanhamento de drift;
 - mecanismos de pseudonimização e um checklist de governança e segurança **ainda não auditados para conformidade com a LGPD**.
+
+Detalhes das correções recentes de coleta, contagem e visualização: [integridade dos ABCs e horários](docs/abc_integridade_e_horarios.md).
 
 ## O que o projeto procura investigar
 

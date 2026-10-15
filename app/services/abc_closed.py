@@ -19,6 +19,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from sqlalchemy import text
 
+from app.services.abc_integrity import (
+    INTEGRITY_DDL, DuplicateRecordError, attach_exposure_to_time_summary, build_time_summary, filter_records, has_behavior,
+    local_timestamp, record_metadata, temporal_candidates_in_scope,
+)
+
 from app.services.abc_methodology import (
     EVIDENCE_RULE_VERSION,
     METHODOLOGY_VERSION,
@@ -141,6 +146,8 @@ def classify_interference_severity(
 ) -> dict[str, Any]:
     code = str(classification).strip().upper()
     criteria = bool(caused_injury or bleeding or targeted_vital_point)
+    if code == "NC" and not criteria:
+        return {"codigo": "C1", "rotulo": "C1 - leve", "intensidade": SEVERITY_LIGHT, "indice_perigo": 0.20, "classificacao_assumida": True}
     if code not in {"C1", "C2"}:
         raise ValueError("A classificação deve ser C1 (leve) ou C2 (intenso).")
     if code == "C1" and criteria:
@@ -164,7 +171,7 @@ def severity_details(value: Any) -> dict[str, Any]:
             "codigo": "NC",
             "rotulo": "Não classificado",
             "intensidade": None,
-            "indice_perigo": 0.50,
+            "indice_perigo": None,
         }
     if intensity == SEVERITY_LIGHT:
         return {
@@ -184,7 +191,7 @@ def severity_details(value: Any) -> dict[str, Any]:
         "codigo": "NC",
         "rotulo": "Não classificado",
         "intensidade": intensity,
-        "indice_perigo": 0.50,
+        "indice_perigo": None,
     }
 
 
@@ -376,7 +383,7 @@ def _initialize_abc_tables(engine) -> None:
             with engine.begin() as conn:
                 conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                 conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('sellas:abc-schema:v4'))"))
-                for statement in statements:
+                for statement in (*statements, *INTEGRITY_DDL):
                     conn.execute(text(statement))
                 _seed_categories(conn)
             return
@@ -517,313 +524,211 @@ def create_custom_category(
     return {**_serialize_row(row), "created": True}
 
 
-def add_closed_record(
-    engine,
-    *,
-    patient_token: str,
-    antecedente_codigo: str,
-    comportamento_codigo: str,
-    consequencia_codigo: str,
-    data_hora: datetime,
-    ambiente: str,
-    classificacao: str,
-    causou_lesao: bool,
-    houve_sangramento: bool,
-    direcionado_ponto_vital: bool,
-    funcao: str,
+def add_closed_record(engine, **kwargs) -> dict[str, Any]:
+    return _save_closed_record(engine, interval_id=None, **kwargs)
+
+
+def update_closed_record(engine, *, interval_id: str, **kwargs) -> dict[str, Any]:
+    return _save_closed_record(engine, interval_id=interval_id, **kwargs)
+
+
+def _save_closed_record(
+    engine, *, patient_token: str, antecedente_codigo: str | None,
+    comportamento_codigo: str, consequencia_codigo: str | None,
+    data_hora: datetime, ambiente: str, classificacao: str,
+    causou_lesao: bool, houve_sangramento: bool, direcionado_ponto_vital: bool,
+    funcao: str | None, interval_id: str | None = None,
+    precisao_horario: str = "minute", frequencia: int = 1,
+    duracao_segundos: float | None = None, fonte_referencia: str | None = None,
+    observador: str | None = None, atendimento_referencia: str | None = None,
+    request_id: str | None = None, confirmar_duplicado: bool = False,
 ) -> dict[str, Any]:
     init_abc_tables(engine)
-    severity = classify_interference_severity(
-        classificacao,
-        caused_injury=causou_lesao,
-        bleeding=houve_sangramento,
-        targeted_vital_point=direcionado_ponto_vital,
-    )
-    function_normalization = normalize_clinical_value(funcao, "funcao")
-    clean_function = str(function_normalization["normalized_value"])
-    if not clean_function:
-        raise ValueError("Informe a função ou hipótese funcional do comportamento.")
-    if len(clean_function) > 120:
-        raise ValueError("A função deve ter no máximo 120 caracteres.")
-    selected = {
-        "antecedente": antecedente_codigo,
-        "comportamento": comportamento_codigo,
-        "consequencia": consequencia_codigo,
-    }
-    end_at = data_hora + timedelta(minutes=INTERVAL_MINUTES)
-    with engine.begin() as conn:
-        categories = conn.execute(
-            text("SELECT id, codigo, COALESCE(nome_normalizado, nome) AS nome, tipo FROM abc_categories WHERE ativa = TRUE ORDER BY tipo, COALESCE(nome_normalizado, nome)")
-        ).mappings().all()
-        available = {(row["tipo"], row["codigo"]) for row in categories}
-        missing = [f"{kind}:{code}" for kind, code in selected.items() if (kind, code) not in available]
-        if missing:
-            raise ValueError(f"Categoria ABC invalida: {', '.join(missing)}")
-
-        session_id = conn.execute(
-            text(
-                """
-                INSERT INTO abc_sessions (
-                    patient_token, data_inicio, data_fim, timezone, ambiente,
-                    observacao_completa, instrumento_versao
-                ) VALUES (
-                    CAST(:patient_token AS UUID), :inicio, :fim, :timezone, :ambiente, TRUE, '1'
-                ) RETURNING id
-                """
-            ),
-            {
-                "patient_token": patient_token,
-                "inicio": data_hora,
-                "fim": end_at,
-                "timezone": DEFAULT_TIMEZONE,
-                "ambiente": ambiente,
-            },
-        ).scalar_one()
-        interval_id = conn.execute(
-            text(
-                """
-                INSERT INTO abc_intervals (
-                    sessao_id, inicio, fim, timezone, duracao_planejada_minutos,
-                    status_observacao, instrumento_versao
-                ) VALUES (
-                    :session_id, :inicio, :fim, :timezone, :minutes, 'observed', '1'
-                ) RETURNING id
-                """
-            ),
-            {
-                "session_id": session_id,
-                "inicio": data_hora,
-                "fim": end_at,
-                "timezone": DEFAULT_TIMEZONE,
-                "minutes": INTERVAL_MINUTES,
-            },
-        ).scalar_one()
-
-        for category in categories:
-            occurred = category["codigo"] == selected[category["tipo"]]
-            selected_behavior = category["tipo"] == "comportamento" and occurred
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO abc_interval_events (
-                        intervalo_id, categoria_id, ocorreu, frequencia, intensidade,
-                        onset_ts, offset_ts,
-                        causou_lesao, houve_sangramento, direcionado_ponto_vital,
-                        funcao_hipotese, funcao_hipotese_original, funcao_hipotese_normalizada,
-                        versao_normalizacao, fonte, revisado_humano
-                    ) VALUES (
-                        :interval_id, :category_id, :occurred, :frequency, :intensity,
-                        :onset_ts, :offset_ts,
-                        :caused_injury, :bleeding, :targeted_vital_point,
-                        :function_raw, :function_raw, :function, :normalization_version,
-                        'registro_fechado', TRUE
-                    )
-                    """
-                ),
-                {
-                    "interval_id": interval_id,
-                    "category_id": category["id"],
-                    "occurred": occurred,
-                    "frequency": 1 if occurred else 0,
-                    "intensity": severity["intensidade"] if selected_behavior else None,
-                    "onset_ts": data_hora if occurred else None,
-                    "offset_ts": data_hora if occurred else None,
-                    "caused_injury": bool(causou_lesao) if selected_behavior else None,
-                    "bleeding": bool(houve_sangramento) if selected_behavior else None,
-                    "targeted_vital_point": bool(direcionado_ponto_vital) if selected_behavior else None,
-                    "function": clean_function if selected_behavior else None,
-                    "function_raw": str(funcao).strip() if selected_behavior else None,
-                    "normalization_version": NORMALIZATION_VERSION if selected_behavior else None,
-                },
-            )
-
-        selected_categories = {
-            category["tipo"]: {"codigo": category["codigo"], "nome": category["nome"]}
-            for category in categories
-            if category["codigo"] == selected[category["tipo"]]
-        }
-        snapshot = {
-            "data_hora": data_hora.isoformat(),
-            "ambiente": ambiente,
-            "antecedente": selected_categories["antecedente"]["nome"],
-            "antecedente_codigo": selected_categories["antecedente"]["codigo"],
-            "comportamento": selected_categories["comportamento"]["nome"],
-            "comportamento_codigo": selected_categories["comportamento"]["codigo"],
-            "consequencia": selected_categories["consequencia"]["nome"],
-            "consequencia_codigo": selected_categories["consequencia"]["codigo"],
-            "classificacao": severity["codigo"],
-            "classificacao_rotulo": severity["rotulo"],
-            "intensidade": severity["intensidade"],
-            "causou_lesao": bool(causou_lesao),
-            "houve_sangramento": bool(houve_sangramento),
-            "direcionado_ponto_vital": bool(direcionado_ponto_vital),
-            "funcao": clean_function,
-        }
-        _write_action_log(
-            conn,
-            patient_token=patient_token,
-            action="registro_adicionado",
-            interval_id=str(interval_id),
-            snapshot=snapshot,
-        )
-
-    return {
-        "ok": True,
-        "session_id": str(session_id),
-        "interval_id": str(interval_id),
-        "data_hora": data_hora.isoformat(),
-        "ambiente": ambiente,
-        "classificacao": severity["codigo"],
-        "funcao": clean_function,
-        **selected,
-    }
-
-
-def update_closed_record(
-    engine,
-    *,
-    patient_token: str,
-    interval_id: str,
-    antecedente_codigo: str,
-    comportamento_codigo: str,
-    consequencia_codigo: str,
-    data_hora: datetime,
-    ambiente: str,
-    classificacao: str,
-    causou_lesao: bool,
-    houve_sangramento: bool,
-    direcionado_ponto_vital: bool,
-    funcao: str,
-) -> dict[str, Any]:
-    init_abc_tables(engine)
-    try:
+    if interval_id:
         uuid.UUID(str(interval_id))
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise ValueError("Identificador do acontecimento inválido.") from exc
-
-    severity = classify_interference_severity(
-        classificacao,
-        caused_injury=causou_lesao,
-        bleeding=houve_sangramento,
-        targeted_vital_point=direcionado_ponto_vital,
-    )
-    function_normalization = normalize_clinical_value(funcao, "funcao")
-    clean_function = str(function_normalization["normalized_value"])
-    if not clean_function:
-        raise ValueError("Informe a função ou hipótese funcional do comportamento.")
+    if request_id:
+        uuid.UUID(str(request_id))
+    if precisao_horario not in {"second", "minute", "approximate", "unknown", "legacy"}:
+        raise ValueError("Precisão de horário inválida.")
+    if not isinstance(frequencia, int) or isinstance(frequencia, bool) or frequencia < 1:
+        raise ValueError("A contagem de respostas deve ser um inteiro positivo.")
+    import math
+    if duracao_segundos is not None and (not math.isfinite(duracao_segundos) or duracao_segundos < 0):
+        raise ValueError("A duração deve ser finita e não negativa.")
+    ambiente = str(ambiente).strip()
+    if not ambiente or len(ambiente) > 160:
+        raise ValueError("Informe um ambiente válido.")
+    for label, value, limit in (("Fonte", fonte_referencia, 200), ("Observador", observador, 160), ("Atendimento", atendimento_referencia, 160)):
+        if value and len(value.strip()) > limit:
+            raise ValueError(f"{label}: máximo de {limit} caracteres.")
+    data_hora = local_timestamp(data_hora)
+    if precisao_horario in {"minute", "approximate"}:
+        data_hora = data_hora.replace(second=0, microsecond=0)
+    elif precisao_horario == "unknown":
+        data_hora = data_hora.replace(hour=0, minute=0, second=0, microsecond=0)
+    severity = classify_interference_severity(classificacao, caused_injury=causou_lesao,
+        bleeding=houve_sangramento, targeted_vital_point=direcionado_ponto_vital)
+    clean_function = normalize_clinical_value(funcao, "funcao")["normalized_value"]
     if len(clean_function) > 120:
         raise ValueError("A função deve ter no máximo 120 caracteres.")
-
-    selected = {
-        "antecedente": antecedente_codigo,
-        "comportamento": comportamento_codigo,
-        "consequencia": consequencia_codigo,
-    }
-    end_at = data_hora + timedelta(minutes=INTERVAL_MINUTES)
+    selected = {"antecedente": antecedente_codigo, "comportamento": comportamento_codigo,
+                "consequencia": consequencia_codigo}
+    metadata = {"record_kind": "episode", "precisao_horario": precisao_horario,
+                "frequencia": frequencia, "duracao_segundos": duracao_segundos,
+                "fonte_referencia": (fonte_referencia or "").strip(),
+                "observador": (observador or "").strip(),
+                "atendimento_referencia": (atendimento_referencia or "").strip(),
+                "source_system": "sellas", "timing_semantics": "episode_timestamp"}
+    if severity.get("classificacao_assumida"):
+        metadata.update({"classificacao_original":"NC", "classificacao_assumida":True,
+                         "classificacao_origem":"regra_responsavel_sem_classificacao_C1"})
+    snapshot = {"data_hora": data_hora.isoformat(), "ambiente": ambiente,
+                "classificacao": severity["codigo"], "classificacao_rotulo": severity["rotulo"], "intensidade": severity["intensidade"],
+                "funcao": clean_function, **selected, **metadata,
+                "causou_lesao": None if severity.get("classificacao_assumida") else causou_lesao,
+                "houve_sangramento": None if severity.get("classificacao_assumida") else houve_sangramento,
+                "direcionado_ponto_vital": None if severity.get("classificacao_assumida") else direcionado_ponto_vital}
+    fingerprint = analysis_run_hash([snapshot], {"interval_id": interval_id})
+    # Envelope técnico para compatibilidade do esquema; não é tempo observado.
+    end_at = data_hora + timedelta(microseconds=1)
     with engine.begin() as conn:
-        before = _load_interval_record(conn, patient_token, interval_id)
-        if not before:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                     {"key": f"sellas:abc:save:{patient_token}"})
+        if request_id:
+            previous = conn.execute(text("SELECT payload_hash, response FROM abc_record_requests WHERE patient_token=CAST(:p AS UUID) AND request_id=CAST(:r AS UUID)"),
+                                    {"p": patient_token, "r": request_id}).mappings().first()
+            if previous:
+                if previous["payload_hash"] != fingerprint:
+                    raise ValueError("Solicitação já utilizada para outro conteúdo. Inicie um novo envio.")
+                return {**previous["response"], "replayed": True}
+        before = _load_interval_record(conn, patient_token, interval_id) if interval_id else None
+        if interval_id and not before:
             raise ValueError("Acontecimento ABC não encontrado para este paciente.")
-
-        categories = conn.execute(
-            text("SELECT id, codigo, COALESCE(nome_normalizado, nome) AS nome, tipo FROM abc_categories WHERE ativa = TRUE ORDER BY tipo, COALESCE(nome_normalizado, nome)")
-        ).mappings().all()
+        if before and before.get("record_kind") != "episode":
+            raise ValueError("Este registro pertence a uma coleta por intervalo. Use a gestão da observação para preservar sua duração.")
+        if before:
+            shared = conn.execute(text("SELECT COUNT(*) FROM abc_intervals WHERE sessao_id=CAST(:s AS UUID)"), {"s": before["session_id"]}).scalar_one()
+            if shared > 1:
+                raise ValueError("Este acontecimento pertence a uma sessão compartilhada. A edição isolada foi bloqueada para preservar os demais intervalos.")
+        categories = conn.execute(text("SELECT id,codigo,COALESCE(nome_normalizado,nome) AS nome,tipo FROM abc_categories WHERE ativa=TRUE")).mappings().all()
         available = {(row["tipo"], row["codigo"]) for row in categories}
-        missing = [f"{kind}:{code}" for kind, code in selected.items() if (kind, code) not in available]
-        if missing:
-            raise ValueError(f"Categoria ABC inválida: {', '.join(missing)}")
-
-        conn.execute(
-            text(
-                """
-                UPDATE abc_sessions
-                SET data_inicio = :inicio, data_fim = :fim, ambiente = :ambiente
-                WHERE id = CAST(:session_id AS UUID)
-                  AND patient_token = CAST(:patient_token AS UUID)
-                """
-            ),
-            {
-                "inicio": data_hora,
-                "fim": end_at,
-                "ambiente": ambiente,
-                "session_id": before["session_id"],
-                "patient_token": patient_token,
-            },
-        )
-        conn.execute(
-            text(
-                """
-                UPDATE abc_intervals
-                SET inicio = :inicio, fim = :fim
-                WHERE id = CAST(:interval_id AS UUID)
-                """
-            ),
-            {"inicio": data_hora, "fim": end_at, "interval_id": interval_id},
-        )
-
+        if not comportamento_codigo or any((kind, code) not in available for kind, code in selected.items() if code):
+            raise ValueError("Categoria ABC inválida.")
+        duplicate = conn.execute(text("""
+            SELECT i.id FROM abc_intervals i JOIN abc_sessions s ON s.id=i.sessao_id
+            WHERE s.patient_token=CAST(:p AS UUID) AND i.inicio=:stamp AND s.ambiente=:environment
+              AND (:exclude_id IS NULL OR i.id::text <> :exclude_id)
+              AND EXISTS (SELECT 1 FROM abc_interval_events e JOIN abc_categories c ON c.id=e.categoria_id
+                          WHERE e.intervalo_id=i.id AND e.ocorreu IS TRUE AND c.tipo='comportamento' AND c.codigo=:behavior)
+              AND COALESCE((SELECT c.codigo FROM abc_interval_events e JOIN abc_categories c ON c.id=e.categoria_id
+                            WHERE e.intervalo_id=i.id AND e.ocorreu IS TRUE AND c.tipo='antecedente' LIMIT 1),'')=COALESCE(:antecedent,'')
+              AND COALESCE((SELECT c.codigo FROM abc_interval_events e JOIN abc_categories c ON c.id=e.categoria_id
+                            WHERE e.intervalo_id=i.id AND e.ocorreu IS TRUE AND c.tipo='consequencia' LIMIT 1),'')=COALESCE(:consequence,'')
+            LIMIT 1
+        """), {"p": patient_token, "stamp": data_hora, "environment": ambiente,
+                "exclude_id": interval_id, "behavior": comportamento_codigo,
+                "antecedent": antecedente_codigo, "consequence": consequencia_codigo}).first()
+        if duplicate and not confirmar_duplicado:
+            raise DuplicateRecordError("Há um acontecimento semelhante na mesma data e horário. Confira o histórico; se forem episódios distintos, marque a confirmação de semelhança.")
+        if before:
+            session_id = before["session_id"]
+            conn.execute(text("""UPDATE abc_sessions SET data_inicio=:start,data_fim=:end,ambiente=:environment,
+                observacao_completa=FALSE WHERE id=CAST(:id AS UUID) AND patient_token=CAST(:p AS UUID)"""),
+                {"start": data_hora,"end": end_at,"environment": ambiente,"id": session_id,"p": patient_token})
+            conn.execute(text("UPDATE abc_intervals SET inicio=:start,fim=:end,metadados=CAST(:metadata AS JSONB),atraso_registro_segundos=GREATEST(0,EXTRACT(EPOCH FROM (criado_em-:start)))::INTEGER WHERE id=CAST(:id AS UUID)"),
+                {"start":data_hora,"end":end_at,"metadata":json.dumps(metadata),"id":interval_id})
+        else:
+            session_id = conn.execute(text("""INSERT INTO abc_sessions
+                (patient_token,data_inicio,data_fim,timezone,ambiente,observacao_completa,instrumento_versao)
+                VALUES(CAST(:p AS UUID),:start,:end,:tz,:environment,FALSE,'2') RETURNING id"""),
+                {"p":patient_token,"start":data_hora,"end":end_at,"tz":DEFAULT_TIMEZONE,"environment":ambiente}).scalar_one()
+            interval_id = str(conn.execute(text("""INSERT INTO abc_intervals
+                (sessao_id,inicio,fim,timezone,duracao_planejada_minutos,status_observacao,instrumento_versao,metadados,atraso_registro_segundos)
+                VALUES(:session,:start,:end,:tz,1,'observed','2',CAST(:metadata AS JSONB),GREATEST(0,EXTRACT(EPOCH FROM (now()-:start)))::INTEGER) RETURNING id"""),
+                {"session":session_id,"start":data_hora,"end":end_at,"tz":DEFAULT_TIMEZONE,"metadata":json.dumps(metadata)}).scalar_one())
         for category in categories:
             occurred = category["codigo"] == selected[category["tipo"]]
-            selected_behavior = category["tipo"] == "comportamento" and occurred
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO abc_interval_events (
-                        intervalo_id, categoria_id, ocorreu, frequencia, intensidade,
-                        onset_ts, offset_ts,
-                        causou_lesao, houve_sangramento, direcionado_ponto_vital,
-                        funcao_hipotese, funcao_hipotese_original, funcao_hipotese_normalizada,
-                        versao_normalizacao, fonte, revisado_humano
-                    ) VALUES (
-                        CAST(:interval_id AS UUID), :category_id, :occurred, :frequency, :intensity,
-                        :onset_ts, :offset_ts,
-                        :caused_injury, :bleeding, :targeted_vital_point,
-                        :function_raw, :function_raw, :function, :normalization_version,
-                        'registro_fechado', TRUE
-                    )
-                    ON CONFLICT (intervalo_id, categoria_id) DO UPDATE SET
-                        ocorreu = EXCLUDED.ocorreu,
-                        frequencia = EXCLUDED.frequencia,
-                        intensidade = EXCLUDED.intensidade,
-                        onset_ts = EXCLUDED.onset_ts,
-                        offset_ts = EXCLUDED.offset_ts,
-                        causou_lesao = EXCLUDED.causou_lesao,
-                        houve_sangramento = EXCLUDED.houve_sangramento,
-                        direcionado_ponto_vital = EXCLUDED.direcionado_ponto_vital,
-                        funcao_hipotese = EXCLUDED.funcao_hipotese,
-                        funcao_hipotese_original = EXCLUDED.funcao_hipotese_original,
-                        funcao_hipotese_normalizada = EXCLUDED.funcao_hipotese_normalizada,
-                        versao_normalizacao = EXCLUDED.versao_normalizacao,
-                        revisado_humano = TRUE
-                    """
-                ),
-                {
-                    "interval_id": interval_id,
-                    "category_id": category["id"],
-                    "occurred": occurred,
-                    "frequency": 1 if occurred else 0,
-                    "intensity": severity["intensidade"] if selected_behavior else None,
-                    "onset_ts": data_hora if occurred else None,
-                    "offset_ts": data_hora if occurred else None,
-                    "caused_injury": bool(causou_lesao) if selected_behavior else None,
-                    "bleeding": bool(houve_sangramento) if selected_behavior else None,
-                    "targeted_vital_point": bool(direcionado_ponto_vital) if selected_behavior else None,
-                    "function": clean_function if selected_behavior else None,
-                    "function_raw": str(funcao).strip() if selected_behavior else None,
-                    "normalization_version": NORMALIZATION_VERSION if selected_behavior else None,
-                },
-            )
+            behavior = category["tipo"] == "comportamento" and occurred
+            conn.execute(text("""INSERT INTO abc_interval_events
+                (intervalo_id,categoria_id,ocorreu,frequencia,intensidade,onset_ts,offset_ts,
+                 causou_lesao,houve_sangramento,direcionado_ponto_vital,funcao_hipotese,
+                 funcao_hipotese_original,funcao_hipotese_normalizada,versao_normalizacao,fonte,revisado_humano)
+                VALUES(CAST(:i AS UUID),:c,:occurred,:frequency,:intensity,:onset,:offset,
+                 :injury,:bleeding,:vital,:function,:raw,:function,:version,'episodio_manual',TRUE)
+                ON CONFLICT(intervalo_id,categoria_id) DO UPDATE SET
+                 ocorreu=EXCLUDED.ocorreu,frequencia=EXCLUDED.frequencia,intensidade=EXCLUDED.intensidade,
+                 onset_ts=EXCLUDED.onset_ts,offset_ts=EXCLUDED.offset_ts,causou_lesao=EXCLUDED.causou_lesao,
+                 houve_sangramento=EXCLUDED.houve_sangramento,direcionado_ponto_vital=EXCLUDED.direcionado_ponto_vital,
+                 funcao_hipotese=EXCLUDED.funcao_hipotese,funcao_hipotese_original=EXCLUDED.funcao_hipotese_original,
+                 funcao_hipotese_normalizada=EXCLUDED.funcao_hipotese_normalizada,fonte=EXCLUDED.fonte,
+                 versao_normalizacao=EXCLUDED.versao_normalizacao,revisado_humano=TRUE"""),
+                {"i":interval_id,"c":category["id"],"occurred":True if occurred else None,
+                 "frequency":frequencia if behavior else (1 if occurred else None),
+                 "intensity":severity["intensidade"] if behavior else None,
+                 "onset":data_hora if behavior and precisao_horario!="unknown" else None,
+                 "offset":data_hora+timedelta(seconds=duracao_segundos) if behavior and duracao_segundos is not None and precisao_horario!="unknown" else None,
+                 "injury":causou_lesao if behavior and not severity.get("classificacao_assumida") else None,"bleeding":houve_sangramento if behavior and not severity.get("classificacao_assumida") else None,
+                 "vital":direcionado_ponto_vital if behavior and not severity.get("classificacao_assumida") else None,"function":clean_function if behavior else None,
+                 "raw":funcao if behavior else None,"version":NORMALIZATION_VERSION})
+        log_snapshot = dict(snapshot)
+        for kind, code in selected.items():
+            log_snapshot[f"{kind}_codigo"] = code
+            log_snapshot[kind] = next((c["nome"] for c in categories if c["tipo"] == kind and c["codigo"] == code), None)
+        _write_action_log(conn,patient_token=patient_token,
+            action="registro_editado" if before else "registro_adicionado",interval_id=str(interval_id),
+            snapshot={**log_snapshot, **({"anterior":before} if before else {})})
+        result={"ok":True,"session_id":str(session_id),"interval_id":str(interval_id),
+                "intervalo_id":str(interval_id),"data_hora":data_hora.isoformat(),"ambiente":ambiente,
+                "classificacao":severity["codigo"],"funcao":clean_function,**selected}
+        if request_id:
+            conn.execute(text("INSERT INTO abc_record_requests(patient_token,request_id,payload_hash,response) VALUES(CAST(:p AS UUID),CAST(:r AS UUID),:h,CAST(:response AS JSONB))"),
+                {"p":patient_token,"r":request_id,"h":fingerprint,"response":json.dumps(result)})
+    return result
 
-        after = _load_interval_record(conn, patient_token, interval_id)
-        if not after:
-            raise ValueError("Não foi possível reler o acontecimento editado.")
-        _write_action_log(
-            conn,
-            patient_token=patient_token,
-            action="registro_editado",
-            interval_id=interval_id,
-            snapshot={**after, "anterior": before},
-        )
-    return {"ok": True, "intervalo_id": interval_id, "registro": after}
+
+def add_observation_window(engine, *, patient_token, start, end, environment, observer,
+                           source_reference, complete_recording, request_id):
+    """Janela real independente do cadastro de episódios; ausência exige coleta completa."""
+    init_abc_tables(engine)
+    if not str(environment).strip() or not str(observer).strip() or not str(source_reference).strip():
+        raise ValueError("Informe ambiente, observador e referência da fonte.")
+    start, end = local_timestamp(start), local_timestamp(end)
+    if end <= start or start.date() != end.date():
+        raise ValueError("Informe início e fim no mesmo dia, com fim posterior ao início.")
+    if not complete_recording:
+        raise ValueError("Confirme que todos os acontecimentos dessa janela já foram registrados.")
+    uuid.UUID(str(request_id))
+    metadata = {"record_kind":"observation", "observador":observer,
+                "fonte_referencia":source_reference, "source_system":"sellas", "complete_recording":True}
+    payload_hash=analysis_run_hash([metadata], {"start":start.isoformat(),"end":end.isoformat(),"environment":environment})
+    with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"),{"key":f"sellas:abc:save:{patient_token}"})
+        previous=conn.execute(text("SELECT payload_hash,response FROM abc_record_requests WHERE patient_token=CAST(:p AS UUID) AND request_id=CAST(:r AS UUID)"),{"p":patient_token,"r":request_id}).mappings().first()
+        if previous:
+            if previous["payload_hash"] != payload_hash:
+                raise ValueError("Solicitação já usada para outra janela.")
+            return {**previous["response"],"replayed":True}
+        overlap=conn.execute(text("""SELECT i.id FROM abc_intervals i JOIN abc_sessions s ON s.id=i.sessao_id
+            WHERE s.patient_token=CAST(:p AS UUID) AND i.status_observacao='observed'
+              AND i.inicio < :end AND i.fim > :start
+              AND COALESCE(i.metadados->>'record_kind','observation')='observation'
+              AND NOT EXISTS(SELECT 1 FROM abc_interval_events e WHERE e.intervalo_id=i.id AND e.fonte='registro_fechado') LIMIT 1"""),
+            {"p":patient_token,"start":start,"end":end}).first()
+        if overlap:
+            raise ValueError("Já existe uma janela observada nesse período. Confira o histórico para evitar somar o mesmo tempo duas vezes.")
+        session_id=conn.execute(text("""INSERT INTO abc_sessions(patient_token,data_inicio,data_fim,timezone,ambiente,observacao_completa,instrumento_versao)
+            VALUES(CAST(:p AS UUID),:start,:end,:tz,:environment,TRUE,'2') RETURNING id"""),
+            {"p":patient_token,"start":start,"end":end,"tz":DEFAULT_TIMEZONE,"environment":environment}).scalar_one()
+        interval_id=conn.execute(text("""INSERT INTO abc_intervals(sessao_id,inicio,fim,timezone,duracao_planejada_minutos,status_observacao,instrumento_versao,metadados)
+            VALUES(:session,:start,:end,:tz,:minutes,'observed','2',CAST(:metadata AS JSONB)) RETURNING id"""),
+            {"session":session_id,"start":start,"end":end,"tz":DEFAULT_TIMEZONE,
+             "minutes":max(1,int((end-start).total_seconds()/60)),"metadata":json.dumps(metadata)}).scalar_one()
+        result={"ok":True,"interval_id":str(interval_id)}
+        _write_action_log(conn,patient_token=patient_token,action="registro_adicionado",interval_id=str(interval_id),
+                          snapshot={"observation_window":True,"start":start.isoformat(),"end":end.isoformat(),**metadata})
+        conn.execute(text("INSERT INTO abc_record_requests(patient_token,request_id,payload_hash,response) VALUES(CAST(:p AS UUID),CAST(:r AS UUID),:h,CAST(:response AS JSONB))"),
+            {"p":patient_token,"r":request_id,"h":payload_hash,"response":json.dumps(result)})
+    return result
 
 
 def delete_closed_record(engine, *, patient_token: str, interval_id: str) -> dict[str, Any]:
@@ -844,18 +749,12 @@ def delete_closed_record(engine, *, patient_token: str, interval_id: str) -> dic
             interval_id=interval_id,
             snapshot=record,
         )
-        deleted = conn.execute(
-            text(
-                """
-                DELETE FROM abc_sessions
-                WHERE id = CAST(:session_id AS UUID)
-                  AND patient_token = CAST(:patient_token AS UUID)
-                """
-            ),
-            {"session_id": record["session_id"], "patient_token": patient_token},
-        ).rowcount
+        deleted = conn.execute(text("DELETE FROM abc_intervals WHERE id=CAST(:i AS UUID)"), {"i":interval_id}).rowcount
         if deleted != 1:
             raise ValueError("Não foi possível remover o acontecimento ABC.")
+        conn.execute(text("""DELETE FROM abc_sessions s WHERE s.id=CAST(:s AS UUID)
+            AND s.patient_token=CAST(:p AS UUID) AND NOT EXISTS(SELECT 1 FROM abc_intervals i WHERE i.sessao_id=s.id)"""),
+            {"s":record["session_id"],"p":patient_token})
     return {"ok": True, "intervalo_id": interval_id, "removido": record}
 
 
@@ -867,6 +766,9 @@ def load_patient_records(engine, patient_token: str) -> list[dict[str, Any]]:
             """
                 SELECT
                     i.id AS intervalo_id,
+                    i.sessao_id AS session_id, i.metadados,
+                    BOOL_OR(e.fonte IN ('registro_fechado','episodio_manual')) AS registro_fechado,
+                    MAX(e.frequencia) FILTER (WHERE c.tipo='comportamento' AND e.ocorreu IS TRUE) AS frequencia,
                     s.data_inicio AS data_hora,
                     i.criado_em AS criado_em,
                     s.ambiente,
@@ -888,6 +790,7 @@ def load_patient_records(engine, patient_token: str) -> list[dict[str, Any]]:
                 WHERE s.patient_token = CAST(:patient_token AS UUID)
                   AND i.status_observacao = 'observed'
                 GROUP BY i.id, i.criado_em, s.data_inicio, s.ambiente
+                HAVING BOOL_OR(c.tipo='comportamento' AND e.ocorreu IS TRUE)
                 ORDER BY s.data_inicio
             """
         ),
@@ -899,6 +802,11 @@ def load_patient_records(engine, patient_token: str) -> list[dict[str, Any]]:
         item["intervalo_id"] = str(item["intervalo_id"])
         item["data_hora"] = item["data_hora"].astimezone(ZoneInfo(DEFAULT_TIMEZONE)).isoformat()
         item["criado_em"] = item["criado_em"].astimezone(ZoneInfo(DEFAULT_TIMEZONE)).isoformat()
+        item.update(record_metadata(item))
+        item["storage_session_id"] = str(item["session_id"])
+        item["session_id"] = (item.get("atendimento_referencia") or None) if item["record_kind"] == "episode" else str(item["session_id"])
+        item["observer_id"] = item.get("observador") or None
+        item["atraso_registro_segundos"] = max(0, int((local_timestamp(item["criado_em"]) - local_timestamp(item["data_hora"])).total_seconds()))
         result.append(_enrich_record(item))
     return result
 
@@ -956,7 +864,8 @@ def load_observation_metadata(
         text(
             f"""
                 SELECT
-                    i.id AS intervalo_id,
+                    i.id AS intervalo_id, i.metadados, i.criado_em,
+                    BOOL_OR(e.fonte IN ('registro_fechado','episodio_manual')) AS registro_fechado,
                     i.sessao_id AS session_id,
                     i.inicio,
                     i.fim,
@@ -980,7 +889,18 @@ def load_observation_metadata(
         ),
         params,
     )
-    return [_serialize_row(row) for row in rows]
+    result = []
+    for row in rows:
+        item = _serialize_row(row)
+        item.update(record_metadata(item))
+        item["storage_session_id"] = str(item["session_id"])
+        if item["record_kind"] == "episode":
+            item["session_id"] = item.get("atendimento_referencia") or None
+            item["duracao_planejada_minutos"] = None
+        item["observer_id"] = item.get("observador") or None
+        item["atraso_registro_segundos"] = max(0, int((local_timestamp(item["criado_em"]) - local_timestamp(item["inicio"])).total_seconds()))
+        result.append(item)
+    return result
 
 
 def build_abc_printable_summary(
@@ -998,37 +918,47 @@ def build_abc_printable_summary(
     """Monta o contrato auditável usado pela prévia e pelos relatórios imprimíveis."""
     # Os registros legados são oficiais: normalize a cópia usada na análise e no
     # resumo, mantendo os valores originais nos campos de auditoria.
-    record_rows = normalize_abc_records(records)
+    record_rows = normalize_abc_records(row for row in records if has_behavior(row))
     interval_rows = list(intervals)
-    temporal_rows_source = list(temporal_candidates)
+    scope_ids = {str(item.get("intervalo_id") or item.get("interval_id")) for item in interval_rows if item.get("record_kind") != "episode"}
+    temporal_rows_source = temporal_candidates_in_scope(temporal_candidates, scope_ids)
     analysis = build_abc_analysis(record_rows)
     quality_audit = audit_abc_data_quality(record_rows, interval_rows)
     exposure = compute_exposure_summary(record_rows, interval_rows)
+    analysis["distribuicao_temporal"] = attach_exposure_to_time_summary(analysis["distribuicao_temporal"], exposure)
     dataset_hash = analysis_run_hash(
         record_rows,
         {
             "methodology_version": METHODOLOGY_VERSION,
             "normalization_version": NORMALIZATION_VERSION,
             "logic_version": logic_version,
+            "intervals": sorted(interval_rows, key=lambda r:str(r.get("intervalo_id") or "")),
+            "temporal_candidates": sorted(temporal_rows_source, key=lambda r:str(r.get("id") or r.get("transition_id") or "")),
         },
     )
-    statuses = Counter(str(item.get("status_observacao") or "unknown") for item in interval_rows)
+    observation_intervals = [item for item in interval_rows if item.get("record_kind") != "episode"]
+    statuses = Counter(str(item.get("status_observacao") or "unknown") for item in observation_intervals)
     observed = statuses.get("observed", 0)
     not_observed = statuses.get("not_observed", 0)
     invalid = statuses.get("invalid", 0)
     not_applicable = statuses.get("not_applicable", 0)
-    total_intervals = len(interval_rows)
+    total_intervals = len(observation_intervals)
     coverage = observed / total_intervals if total_intervals else 0.0
     session_ids = {str(item.get("session_id")) for item in interval_rows if item.get("session_id")}
     observed_minutes = sum(
         max(0, int(item.get("duracao_planejada_minutos") or 0))
-        for item in interval_rows
+        for item in observation_intervals
         if item.get("status_observacao") == "observed"
     )
-    missing_events = sum(int(item.get("eventos_nao_informados") or 0) for item in interval_rows)
+    missing_events = sum(int(item.get("eventos_nao_informados") or 0) for item in observation_intervals)
+    missing_episode_fields = sum(not row.get(field) or row.get(field) == "Não informado"
+        for row in record_rows for field in ("antecedente", "consequencia"))
     unreviewed_events = sum(int(item.get("eventos_sem_revisao") or 0) for item in interval_rows)
+    positive_ids = {str(item.get("intervalo_id")) for item in record_rows}
     retroactive = sum(
-        1 for item in interval_rows if int(item.get("atraso_registro_segundos") or 0) > 0
+        1 for item in interval_rows if str(item.get("intervalo_id")) in positive_ids
+        and ((item.get("criado_em") and item.get("inicio") and local_timestamp(item["criado_em"]).date() > local_timestamp(item["inicio"]).date())
+             or (not item.get("criado_em") and int(item.get("atraso_registro_segundos") or 0) >= 86400))
     )
     versions = sorted({str(item.get("instrumento_versao")) for item in interval_rows if item.get("instrumento_versao")})
     occurrence_interval_ids = {
@@ -1141,7 +1071,7 @@ def build_abc_printable_summary(
     missing_ratio = (not_observed + invalid + not_applicable) / total_intervals if total_intervals else 1.0
     warnings = []
     if total_intervals == 0:
-        quality = "insuficiente"
+        quality = "inicial" if record_rows else "insuficiente"
         warnings.append("Não há intervalos no período selecionado.")
     elif coverage >= 0.90 and invalid == 0 and missing_events == 0:
         quality = "adequada"
@@ -1216,9 +1146,9 @@ def build_abc_printable_summary(
     if len(set(clustered_sessions)) >= 2 and clustered_outcomes:
         top_behavior_cluster_interval = cluster_bootstrap_interval(clustered_outcomes, clustered_sessions)
     top_chain = (analysis.get("cadeias_completas") or [{}])[0]
-    if observed:
+    if record_rows:
         descriptive = (
-            f"Foram analisados {observed} intervalos observados em {len(session_ids)} sessão(ões). "
+            f"Foram analisados {len(record_rows)} acontecimentos ABC em {len(session_ids)} atendimento(s) identificado(s). "
             f"O comportamento mais frequente foi '{top_behavior['nome']}', o antecedente mais frequente foi "
             f"'{top_antecedent['nome']}' e a consequência mais frequente foi '{top_consequence['nome']}'."
         )
@@ -1264,11 +1194,12 @@ def build_abc_printable_summary(
             "invalid_intervals": invalid,
             "not_applicable_intervals": not_applicable,
             "coverage": min(1.0, max(0.0, coverage)),
-            "observed_hours": observed_minutes / 60,
+            "observed_hours": exposure["observed_hours"],
             "occurrences_per_observed_hour": exposure["occurrences_per_hour"],
             "opportunities_without_occurrence": exposure["opportunities_without_occurrence"],
-            "occurrence_intervals": len(occurrence_interval_ids),
-            "occurrence_percentage": min(1.0, len(occurrence_interval_ids) / observed) if observed else 0.0,
+            "occurrence_intervals": exposure["occurrence_intervals"],
+            "occurrence_percentage": min(1.0, exposure["occurrence_intervals"] / observed) if observed else None,
+            "episode_records": len(record_rows),
             "missing_percentage": min(1.0, max(0.0, missing_ratio)),
             "exposure": exposure,
         },
@@ -1305,6 +1236,8 @@ def build_abc_printable_summary(
             "retroactive_records": retroactive,
             "unreviewed_events": unreviewed_events,
             "missing_event_values": missing_events,
+            "missing_episode_fields": missing_episode_fields,
+            "c1_por_regra": sum(bool(row.get("classificacao_assumida")) for row in record_rows),
             "censored_chains": sum(item.get("validation_status") == "censored" for item in temporal_rows_source),
             "warnings": warnings,
         },
@@ -1484,7 +1417,8 @@ def _load_interval_record(conn, patient_token: str, interval_id: str) -> dict[st
         text(
             """
             SELECT
-                s.id AS session_id,
+                s.id AS session_id, i.metadados,
+                BOOL_OR(e.fonte IN ('registro_fechado','episodio_manual')) AS registro_fechado,
                 i.id AS intervalo_id,
                 s.data_inicio AS data_hora,
                 s.ambiente,
@@ -1515,6 +1449,7 @@ def _load_interval_record(conn, patient_token: str, interval_id: str) -> dict[st
         return None
     item = _serialize_row(row)
     item["data_hora"] = row["data_hora"].astimezone(ZoneInfo(DEFAULT_TIMEZONE)).isoformat()
+    item.update(record_metadata(item))
     return _enrich_record(item)
 
 
@@ -1576,18 +1511,36 @@ def _serialize_row(row) -> dict[str, Any]:
 
 def _enrich_record(item: dict[str, Any]) -> dict[str, Any]:
     severity = severity_details(item.get("intensidade"))
+    if severity["codigo"] == "NC":
+        item.update({"classificacao_original":"NC", "classificacao_assumida":True,
+                     "classificacao_origem":"regra_responsavel_sem_classificacao_C1"})
+        item["intensidade_original"] = item.get("intensidade")
+        item["intensidade"] = SEVERITY_LIGHT
+        severity = severity_details(SEVERITY_LIGHT)
+    if item.get("classificacao_assumida"):
+        for flag in ("causou_lesao", "houve_sangramento", "direcionado_ponto_vital"):
+            item[flag] = True if item.get(flag) is True else None
+        severity = {**severity, "rotulo": "C1 - leve (regra do responsável)"}
     item.update(
         {
             "classificacao": severity["codigo"],
             "classificacao_rotulo": severity["rotulo"],
             "indice_perigo": severity["indice_perigo"],
             "funcao": item.get("funcao") or "Não informada",
-            "causou_lesao": bool(item.get("causou_lesao")),
-            "houve_sangramento": bool(item.get("houve_sangramento")),
-            "direcionado_ponto_vital": bool(item.get("direcionado_ponto_vital")),
+            "causou_lesao": bool(item.get("causou_lesao")) if item.get("causou_lesao") is not None else None,
+            "houve_sangramento": bool(item.get("houve_sangramento")) if item.get("houve_sangramento") is not None else None,
+            "direcionado_ponto_vital": bool(item.get("direcionado_ponto_vital")) if item.get("direcionado_ponto_vital") is not None else None,
         }
     )
     return item
+
+
+def _record_time_label(row, timestamp):
+    precision = row.get("precisao_horario", "second")
+    if precision == "unknown":
+        return "Não informado"
+    label = timestamp.strftime("%H:%M:%S" if precision == "second" else "%H:%M")
+    return f"≈ {label}" if precision == "approximate" else label
 
 
 def _smoothed_probability(successes: int, trials: int) -> float:
@@ -1614,7 +1567,7 @@ def predict_abc_behavior(
     alpha: float = 0.30,
     recent_window: int = 20,
 ) -> dict[str, Any]:
-    rows = sorted(normalize_abc_records(records), key=lambda item: str(item.get("data_hora", "")))
+    rows = sorted(normalize_abc_records(row for row in records if has_behavior(row)), key=lambda item: str(item.get("data_hora", "")))
     behavior = normalize_clinical_value(behavior, "comportamento")["normalized_value"]
     antecedent = normalize_clinical_value(antecedent, "antecedente")["normalized_value"] if antecedent else None
     environment = normalize_clinical_value(environment, "ambiente")["normalized_value"] if environment else None
@@ -1707,7 +1660,7 @@ def predict_abc_behavior(
         sample_size=len(context_rows),
         session_count=session_count,
         day_count=day_count,
-        missing_count=sum(not row.get("classificacao") or row.get("classificacao") == "NC" for row in context_rows),
+        missing_count=sum(not row.get("classificacao") or row.get("classificacao") == "NC" or row.get("classificacao_assumida",False) for row in context_rows),
         positive_count=context_successes,
         negative_count=0,
     ).to_dict()
@@ -1764,7 +1717,7 @@ def predict_abc_behavior(
 
 
 def build_abc_analysis(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    rows = sorted(normalize_abc_records(records), key=lambda item: str(item.get("data_hora", "")))
+    rows = sorted(normalize_abc_records(row for row in records if has_behavior(row)), key=lambda item: str(item.get("data_hora", "")))
     total = len(rows)
     session_ids = {
         str(row.get("session_id") or row.get("sessao_id") or row.get("atendimento_id"))
@@ -2003,13 +1956,17 @@ def build_abc_analysis(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     ]
 
     timeline = []
-    for row in rows[-500:]:
+    for row in rows:
+        if row.get("precisao_horario") == "unknown":
+            continue
         timestamp = datetime.fromisoformat(str(row["data_hora"]))
+        if row.get("precisao_horario") in {"minute", "approximate", "legacy"}:
+            timestamp = timestamp.replace(second=0,microsecond=0)
         timeline.append(
             {
                 "data_hora": timestamp.isoformat(),
                 "data": timestamp.date().isoformat(),
-                "hora": timestamp.strftime("%H:%M:%S"),
+                "hora": _record_time_label(row, timestamp),
                 "ambiente": row.get("ambiente") or "Nao informado",
                 "classificacao": row.get("classificacao_rotulo") or "Não classificado",
                 "funcao": row.get("funcao") or "Não informada",
@@ -2037,7 +1994,7 @@ def build_abc_analysis(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 for key, value in {
                     **row,
                     "data": timestamp.date().isoformat(),
-                    "hora": timestamp.strftime("%H:%M:%S"),
+                    "hora": _record_time_label(row, timestamp),
                 }.items()
                 if key != "normalization_audit"
             }
@@ -2049,7 +2006,7 @@ def build_abc_analysis(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         sample_size=total,
         session_count=len(session_ids),
         day_count=day_count,
-        missing_count=severity_counts.get("NC", 0),
+        missing_count=severity_counts.get("NC", 0) + sum(bool(row.get("classificacao_assumida")) for row in rows),
         positive_count=total,
         negative_count=0,
     ).to_dict()
@@ -2059,11 +2016,14 @@ def build_abc_analysis(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "normalization_version": NORMALIZATION_VERSION,
         "evidence_rule_version": EVIDENCE_RULE_VERSION,
         "total_registros": total,
+        "dataset_hash": analysis_run_hash(rows, {"methodology_version": METHODOLOGY_VERSION}),
+        "distribuicao_temporal": build_time_summary(rows),
         "sessoes_unicas": len(session_ids),
         "dias_unicos": day_count,
         "comportamentos_distintos": len(behavior_counts),
         "ambientes_distintos": len(environment_counts),
         "c1_leve": severity_counts.get("C1", 0),
+        "c1_por_regra": sum(bool(row.get("classificacao_assumida")) for row in rows),
         "c2_intenso": severity_counts.get("C2", 0),
         "nao_classificados": severity_counts.get("NC", 0),
         "serie_temporal": [

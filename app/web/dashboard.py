@@ -2,6 +2,9 @@ import html
 import math
 import os
 import sys
+import uuid
+import hashlib
+import json
 from datetime import date, datetime
 from pathlib import Path
 
@@ -13,6 +16,8 @@ import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from app.services.abc_closed import parse_hour_minute_text
+from app.services.abc_integrity import local_timestamp
+from app.web.abc_charts import build_hourly_figure, category_counts, hourly_rows, records_in_hour_bin
 from app.services.abc_prediction_report import (
     abc_report_filename,
     build_abc_report_docx,
@@ -42,11 +47,11 @@ PASTEL_BAND = "rgba(216, 189, 114, 0.24)"
 NEW_ABC_OPTION = "Digitar nova opção..."
 NEW_FUNCTION_OPTION = "Digitar nova função..."
 ABC_FUNCTIONS = [
+    "Indeterminada / em avaliação",
     "Atenção social",
     "Acesso a item ou atividade",
     "Fuga ou esquiva",
     "Reforçamento automático",
-    "Indeterminada / em avaliação",
 ]
 
 
@@ -283,8 +288,23 @@ def load_abc_categories() -> list[dict]:
     return response.json()
 
 
-def load_abc_analysis(patient: str, environment: str | None = None) -> dict:
-    params = {"paciente": patient}
+def _abc_scope_params(patient: str) -> dict:
+    scope = st.session_state.get("abc_current_scope") or {}
+    return dict(scope.get("params") or {}) if scope.get("patient") == patient else {}
+
+
+def _abc_request_id(patient: str, payload: dict, operation: str) -> str:
+    content = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    key = f"abc_request::{patient}::{operation}"
+    entry = st.session_state.get(key) or {}
+    if entry.get("content") != content:
+        entry = {"content": content, "id": str(uuid.uuid4())}
+        st.session_state[key] = entry
+    return entry["id"]
+
+
+def load_abc_analysis(patient: str, environment: str | None = None, *, scoped: bool = False) -> dict:
+    params = {"paciente": patient, **(_abc_scope_params(patient) if scoped else {})}
     if environment:
         params["ambiente"] = environment
     response = requests.get(
@@ -323,6 +343,7 @@ def load_abc_report_summary(
         "gerado_por": generated_by,
         "formato": output_format,
     }
+    params.update({k:v for k,v in _abc_scope_params(patient).items() if k in {"comportamento", "classificacao"}})
     if environment:
         params["ambiente"] = environment
     response = requests.get(
@@ -343,7 +364,7 @@ def load_abc_prediction(
     classification: str | None = None,
     function: str | None = None,
 ) -> dict:
-    params = {"paciente": patient, "comportamento": behavior}
+    params = {"paciente": patient, **{k:v for k,v in _abc_scope_params(patient).items() if k in {"data_inicio","data_fim","incluir_finais_semana"}}, "comportamento": behavior}
     if antecedent:
         params["antecedente"] = antecedent
     if environment:
@@ -377,6 +398,7 @@ def load_abc_functional_ai(
             "ambiente": environment,
             "pergunta": question or None,
             "limite_fontes": 5,
+            **{k:v for k,v in _abc_scope_params(patient).items() if k != "faixa_minutos"},
         },
         timeout=max(API_TIMEOUT_SECONDS, 180),
     )
@@ -397,22 +419,11 @@ def detect_abc_temporal_chains(patient: str, config: dict) -> dict:
 
 
 def load_abc_temporal_chains(patient: str) -> dict:
-    params = {"paciente": patient}
-    responses = {
-        "candidates": requests.get(f"{API_URL}/api/abc/chains/candidates", params=params, timeout=API_TIMEOUT_SECONDS),
-        "stats": requests.get(f"{API_URL}/api/abc/chains/stats", params=params, timeout=API_TIMEOUT_SECONDS),
-        "matrix": requests.get(f"{API_URL}/api/abc/chains/transition-matrix", params=params, timeout=API_TIMEOUT_SECONDS),
-        "timeline": requests.get(f"{API_URL}/api/abc/chains/timeline", params=params, timeout=API_TIMEOUT_SECONDS),
-    }
-    for response in responses.values():
-        if not response.ok:
-            raise RuntimeError(_api_error_message(response))
-    return {
-        "candidates": responses["candidates"].json(),
-        "stats": responses["stats"].json().get("stats", []),
-        "matrix": responses["matrix"].json().get("matrix", []),
-        "timeline": responses["timeline"].json().get("timeline", []),
-    }
+    params={"paciente":patient,**{k:v for k,v in _abc_scope_params(patient).items() if k!="faixa_minutos"}}
+    response=requests.get(f"{API_URL}/api/abc/chains/scoped",params=params,timeout=API_TIMEOUT_SECONDS)
+    if not response.ok:
+        raise RuntimeError(_api_error_message(response))
+    return response.json()
 
 
 def review_abc_temporal_chain(candidate_id: str, status: str, reviewer: str, note: str) -> dict:
@@ -454,22 +465,24 @@ def create_abc_chain_rule(from_code: str, to_code: str, rationale: str) -> dict:
 def save_abc_record(patient: str, payload: dict) -> dict:
     response = requests.post(
         f"{API_URL}/api/abc/registros",
-        json={"paciente": patient, **payload},
+        json={"paciente": patient, **payload, "request_id": _abc_request_id(patient, payload, "add")},
         timeout=API_TIMEOUT_SECONDS,
     )
     if not response.ok:
         raise RuntimeError(_api_error_message(response))
+    st.session_state.pop(f"abc_request::{patient}::add", None)
     return response.json()
 
 
 def update_abc_record(patient: str, interval_id: str, payload: dict) -> dict:
     response = requests.patch(
         f"{API_URL}/api/abc/registros/{interval_id}",
-        json={"paciente": patient, **payload},
+        json={"paciente": patient, **payload, "request_id": _abc_request_id(patient, payload, f"edit::{interval_id}")},
         timeout=API_TIMEOUT_SECONDS,
     )
     if not response.ok:
         raise RuntimeError(_api_error_message(response))
+    st.session_state.pop(f"abc_request::{patient}::edit::{interval_id}", None)
     return response.json()
 
 
@@ -885,7 +898,7 @@ def render_abc_temporal_chains(patient: str, categories: list[dict]) -> None:
         "Permitir transição entre sessões clínicas diferentes",
         value=False,
         key="abc_chain_allow_cross_session",
-        help="Permanece desligado por padrão. Registros legados contínuos do mesmo dia e ambiente são identificados separadamente.",
+        help="Cadeias temporais exigem início e fim medidos dos eventos. Horários isolados de episódios não fornecem essa medida.",
     )
     if st.button(
         "Detectar e recalcular cadeias temporais",
@@ -915,6 +928,8 @@ def render_abc_temporal_chains(patient: str, categories: list[dict]) -> None:
 
     try:
         data = load_abc_temporal_chains(patient)
+        if data.get("aviso"):
+            st.info(data["aviso"])
     except Exception as exc:
         st.info(f"A análise temporal será exibida após a primeira detecção: {exc}")
         return
@@ -1153,10 +1168,82 @@ def render_abc_temporal_chains(patient: str, categories: list[dict]) -> None:
         )
 
 
+def render_abc_hour_overview(patient: str, analysis: dict) -> None:
+    temporal = analysis.get("distribuicao_temporal") or {}
+    rows = hourly_rows(temporal)
+    st.markdown("### Em quais horários há mais interferentes registrados?")
+    if not rows:
+        st.info("Não há episódios com horário informado neste recorte. Consulte Registros para incluir ou conferir os horários da fonte.")
+        return
+    peaks = [row for row in rows if row["destaque"]]
+    peak = peaks[0]
+    main, total, days = st.columns([2, 1, 1])
+    with main:
+        render_metric_card("Faixa com mais registros" if len(peaks) == 1 else "Faixas empatadas no maior total",
+                           peak["faixa"] if len(peaks) == 1 else f"{len(peaks)} faixas empatadas",
+                           f"{peak['quantidade']} episódios por faixa · {peak['percentual_total']:.1%} do total")
+    with total:
+        render_metric_card("Episódios no recorte", str(temporal.get("total_registros", 0)),
+                           f"{temporal.get('horarios_validos', 0)} com horário informado")
+    with days:
+        render_metric_card("Dias com registros", str(temporal.get("dias", 0)),
+                           f"{peak['dias']} na faixa de destaque" if len(peaks) == 1 else "Consulte os dias de cada faixa no gráfico")
+    ordering = st.radio("Ordem das faixas", ["Horário do dia", "Mais registros"], horizontal=True,
+                        key=f"abc_hour_order::{patient}")
+    rows = hourly_rows(temporal, ranked=ordering == "Mais registros")
+    chart = apply_chart_theme(build_hourly_figure(rows))
+    chart.update_layout(hovermode="closest", margin=dict(l=130, r=80, t=12, b=45))
+    if len(rows) > 16:
+        with st.container(height=540):
+            st.plotly_chart(chart, theme=None, width="stretch", key=f"abc_hours_chart::{patient}")
+    else:
+        st.plotly_chart(chart, theme=None, width="stretch", key=f"abc_hours_chart::{patient}")
+    st.caption("Laranja: maior concentração (inclui empates). Azul: demais faixas. Valores: episódios e percentual de todos os registros do recorte. Horário de Brasília.")
+    st.caption(f"Sem horário: {temporal.get('sem_horario', 0)} · Horários inválidos: {temporal.get('horarios_invalidos', 0)} · Aproximados: {temporal.get('horarios_aproximados', 0)} · Precisão legada não confirmada: {temporal.get('precisao_legada', 0)}.")
+    st.caption("Use a concentração e a repetição entre dias para priorizar a observação. Sem tempo observado por faixa, as contagens não estimam risco por hora. Faixas sem registros não comprovam ausência de comportamento.")
+    with st.expander("Detalhar uma faixa: comportamentos, ambientes e dias"):
+        labels = [row["faixa"] for row in rows]
+        chosen = st.selectbox("Faixa para detalhar", labels, index=labels.index(peak["faixa"]),
+                              key=f"abc_hour_detail::{patient}")
+        selected = next(row for row in rows if row["faixa"] == chosen)
+        records = records_in_hour_bin(analysis.get("registros_para_gestao") or [], selected["inicio"],
+                                     int(temporal.get("faixa_minutos") or 60))
+        st.write(f"**{selected['quantidade']} episódios** em **{selected['dias']} dias**, com {selected['respostas']} respostas registradas.")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Comportamentos nesta faixa**")
+            render_html_table(pd.DataFrame(category_counts(records, "comportamento")), ["Categoria", "Episódios"], max_rows=50)
+        with right:
+            st.markdown("**Ambientes nesta faixa**")
+            render_html_table(pd.DataFrame(category_counts(records, "ambiente")), ["Categoria", "Episódios"], max_rows=50)
+        by_day = {}
+        for record in records:
+            day = local_timestamp(record["data_hora"]).strftime("%d/%m/%Y")
+            by_day[day] = by_day.get(day, 0) + 1
+        st.markdown("**Repetição entre dias**")
+        day_rows = [{"Data": day, "Episódios": count} for day, count in sorted(by_day.items(), key=lambda item: (-item[1], item[0]))]
+        with st.container(height=240):
+            render_html_table(pd.DataFrame(day_rows), ["Data", "Episódios"], max_rows=len(day_rows))
+    with st.expander("Tabela de todas as faixas"):
+        table = pd.DataFrame(rows).rename(columns={"faixa": "Faixa", "quantidade": "Episódios", "dias": "Dias com registros", "respostas": "Respostas"})
+        table["% do total"] = table["percentual_total"].map(lambda value: f"{value:.1%}")
+        with st.container(height=340):
+            render_html_table(table, ["Faixa", "Episódios", "% do total", "Dias com registros", "Respostas"], max_rows=96)
+
+
 def render_abc_registration_and_analysis(patient: str) -> None:
-    st.subheader("Análise ABC e cadeias fechadas")
+    if st.session_state.pop("abc_reset_after_save", False):
+        for field in ("behavior", "record_time", "record_second", "classification", "function", "frequency", "duration_known", "duration", "confirm_duplicate"):
+            st.session_state.pop(f"abc_{field}", None)
+    if st.session_state.get("abc_form_patient") != patient:
+        for field in ("antecedent", "behavior", "consequence", "new_antecedent", "new_behavior", "new_consequence",
+                      "record_date", "record_time", "record_second", "environment", "new_environment", "classification",
+                      "function", "new_function", "time_precision", "source_reference", "observer", "appointment",
+                      "frequency", "duration_known", "duration", "confirm_duplicate", "caused_injury", "bleeding", "targeted_vital_point"):
+            st.session_state.pop(f"abc_{field}", None)
+        st.session_state["abc_form_patient"] = patient
     st.caption(
-        "Registre a cadeia A-B-C com precisão de segundos. O Supabase, os gráficos, as probabilidades e o Excel do paciente são atualizados a cada ação."
+        "Registros ABC do Sellas. Use os filtros para comparar períodos e as abas para consultar ou adicionar dados."
     )
 
     saved_message = st.session_state.pop("abc_saved_message", None)
@@ -1180,1413 +1267,1573 @@ def render_abc_registration_and_analysis(patient: str) -> None:
         st.warning("As categorias fechadas de antecedente, comportamento e consequência ainda não estão completas.")
         return
 
-    antecedent_labels = antecedent_labels + [NEW_ABC_OPTION]
+    antecedent_labels = ["Não informado", *antecedent_labels, NEW_ABC_OPTION]
     behavior_labels = behavior_labels + [NEW_ABC_OPTION]
-    consequence_labels = consequence_labels + [NEW_ABC_OPTION]
+    consequence_labels = ["Não informado", *consequence_labels, NEW_ABC_OPTION]
 
-    st.markdown("### Registrar acontecimento")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        antecedent = st.selectbox("Antecedente", antecedent_labels, key="abc_antecedent")
-        new_antecedent = ""
-        if antecedent == NEW_ABC_OPTION:
-            new_antecedent = st.text_input(
-                "Digite o novo antecedente",
-                max_chars=200,
-                placeholder="Ex.: mudança inesperada",
-                key="abc_new_antecedent",
-            )
-    with c2:
-        behavior = st.selectbox("Comportamento", behavior_labels, key="abc_behavior")
-        new_behavior = ""
-        if behavior == NEW_ABC_OPTION:
-            new_behavior = st.text_input(
-                "Digite o novo comportamento",
-                max_chars=200,
-                placeholder="Ex.: jogar material no chão",
-                key="abc_new_behavior",
-            )
-    with c3:
-        consequence = st.selectbox("Consequência", consequence_labels, key="abc_consequence")
-        new_consequence = ""
-        if consequence == NEW_ABC_OPTION:
-            new_consequence = st.text_input(
-                "Digite a nova consequência",
-                max_chars=200,
-                placeholder="Ex.: retirada da atividade",
-                key="abc_new_consequence",
-            )
-
-    default_environments = ["Sala de terapia", "Sala de aula", "Casa", "Refeitório", "Área externa"]
-    observed_environments = analysis_all.get("ambientes_observados", [])
-    environment_options = list(dict.fromkeys([*default_environments, *observed_environments]))
-    new_environment_option = "Digitar novo ambiente..."
-    environment_options.append(new_environment_option)
-
-    c4, c5, c6, c7 = st.columns([1, 1, 0.65, 1.2])
-    with c4:
-        record_date = st.date_input(
-            "Data do registro",
-            value=date.today(),
-            format="DD/MM/YYYY",
-            key="abc_record_date",
-        )
-    with c5:
-        record_time_text = st.text_input(
-            "Hora e minuto",
-            value=datetime.now().strftime("%H:%M"),
-            placeholder="Ex.: 9:30, 0930 ou 9h30",
-            help="Ao digitar, o horário é interpretado automaticamente.",
-            key="abc_record_time",
-        )
-    with c6:
-        record_second = st.number_input(
-            "Segundo",
-            min_value=0,
-            max_value=59,
-            value=datetime.now().second,
-            step=1,
-            key="abc_record_second",
-        )
-    with c7:
-        environment_option = st.selectbox("Ambiente", environment_options, key="abc_environment")
-        custom_environment = ""
-        if environment_option == new_environment_option:
-            custom_environment = st.text_input(
-                "Digite o novo ambiente",
-                max_chars=160,
-                placeholder="Ex.: pátio coberto",
-                key="abc_new_environment",
-            )
-
-    st.markdown("#### Classificação do comportamento interferente")
-    severity_col, function_col = st.columns([1, 1.4])
-    with severity_col:
-        classification_label = st.radio(
-            "Nível observado",
-            ["C1 - leve", "C2 - intenso"],
-            horizontal=True,
-            key="abc_classification",
-            help="C1: sem lesão, sangramento ou direção a ponto vital. C2: ao menos um desses critérios ocorreu.",
-        )
-    function_options = list(
-        dict.fromkeys(
-            [
-                *ABC_FUNCTIONS,
-                *[
-                    item
-                    for item in analysis_all.get("funcoes_observadas", [])
-                    if item and item != "Não informada"
-                ],
-                NEW_FUNCTION_OPTION,
-            ]
-        )
-    )
-    with function_col:
-        function_option = st.selectbox(
-            "Função informada (hipótese funcional)",
-            function_options,
-            key="abc_function",
-        )
-        custom_function = ""
-        if function_option == NEW_FUNCTION_OPTION:
-            custom_function = st.text_input(
-                "Digite a função ou hipótese",
-                max_chars=120,
-                placeholder="Ex.: acesso a atenção de pares",
-                key="abc_new_function",
-            )
-
-    caused_injury = False
-    bleeding = False
-    targeted_vital_point = False
-    if classification_label.startswith("C2"):
-        st.caption("Marque ao menos um critério observado para classificar como C2 - intenso.")
-        criterion_1, criterion_2, criterion_3 = st.columns(3)
-        with criterion_1:
-            caused_injury = st.checkbox("Machucou ou feriu", key="abc_caused_injury")
-        with criterion_2:
-            bleeding = st.checkbox("Houve sangramento", key="abc_bleeding")
-        with criterion_3:
-            targeted_vital_point = st.checkbox(
-                "Direcionado a ponto vital",
-                key="abc_targeted_vital_point",
-            )
-    else:
-        st.caption("C1 - leve: não machucou, não feriu, não sangrou e não foi direcionado a ponto vital.")
-
-    submitted = st.button(
-        "Adicionar acontecimento ABC",
-        type="primary",
-        use_container_width=True,
-        key="abc_add_record",
-    )
-
-    if submitted:
-        environment = custom_environment.strip() if environment_option == new_environment_option else environment_option
-        selected_function = custom_function.strip() if function_option == NEW_FUNCTION_OPTION else function_option
-        if not environment:
-            st.error("Informe o ambiente antes de adicionar.")
-        elif not selected_function:
-            st.error("Informe a função ou hipótese funcional.")
-        elif classification_label.startswith("C2") and not (
-            caused_injury or bleeding or targeted_vital_point
-        ):
-            st.error("C2 exige ao menos um critério objetivo de intensidade.")
-        else:
-            try:
-                antecedent_code = _resolve_abc_code(
-                    patient, antecedent, new_antecedent, "antecedente", antecedent_codes
-                )
-                behavior_code = _resolve_abc_code(
-                    patient, behavior, new_behavior, "comportamento", behavior_codes
-                )
-                consequence_code = _resolve_abc_code(
-                    patient, consequence, new_consequence, "consequencia", consequence_codes
-                )
-                parsed_record_time = parse_hour_minute_text(record_time_text)
-                save_result = save_abc_record(
-                    patient,
-                    {
-                        "antecedente_codigo": antecedent_code,
-                        "comportamento_codigo": behavior_code,
-                        "consequencia_codigo": consequence_code,
-                        "data": record_date.isoformat(),
-                        "hora": parsed_record_time.replace(second=int(record_second)).strftime("%H:%M:%S"),
-                        "ambiente": environment,
-                        "classificacao": classification_label[:2],
-                        "causou_lesao": caused_injury,
-                        "houve_sangramento": bleeding,
-                        "direcionado_ponto_vital": targeted_vital_point,
-                        "funcao": selected_function,
-                    },
-                )
-                if save_result.get("excel_warning"):
-                    st.session_state["abc_saved_warning"] = save_result["excel_warning"]
-                    st.session_state["abc_saved_message"] = "Registro ABC adicionado e gráficos atualizados."
-                elif save_result.get("excel_status") == "queued":
-                    st.session_state["abc_saved_message"] = (
-                        "Registro ABC adicionado. Os gráficos foram atualizados e o Excel está sendo gerado em segundo plano."
-                    )
-                else:
-                    st.session_state["abc_saved_message"] = "Registro ABC adicionado. Os gráficos e o Excel foram atualizados."
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Não foi possível adicionar o registro: {exc}")
-
-    total_all = int(analysis_all.get("total_registros", 0))
-
-    excel_col, path_col = st.columns([1, 2])
+    all_time = analysis_all.get("distribuicao_temporal") or {}
+    window_dates=[date.fromisoformat(str(w["inicio"])[:10]) for w in analysis_all.get("janelas_observadas",[])]
+    available_dates=window_dates + ([date.fromisoformat(all_time["inicio"]),date.fromisoformat(all_time["fim"])] if all_time.get("inicio") else [])
+    first_date=min(available_dates) if available_dates else date.today()
+    last_date=max(available_dates) if available_dates else date.today()
+    with st.expander("Filtros: período, ambiente, comportamento e classificação"):
+        filter_date, filter_environment, filter_behavior = st.columns([1.2, 1, 1])
+        with filter_date:
+            selected_period = st.date_input("Período da análise e dos relatórios", value=(first_date,last_date),
+                                        format="DD/MM/YYYY", key=f"abc_scope_period::{patient}")
+        if not isinstance(selected_period,(tuple,list)) or len(selected_period)!=2:
+            st.info("Escolha a data inicial e a data final para analisar.")
+            selected_period = st.session_state.get(f"abc_last_period::{patient}", (first_date, last_date))
+        st.session_state[f"abc_last_period::{patient}"] = selected_period
+        analysis_start, analysis_end = selected_period
+        with filter_environment:
+            analysis_environment = st.selectbox("Ambiente da análise", ["Todos os ambientes",*analysis_all.get("ambientes_observados",[])],key="abc_analysis_environment")
+        with filter_behavior:
+            selected_behavior = st.selectbox("Comportamento da análise", ["Todos",*analysis_all.get("comportamentos_observados",[])],key=f"abc_scope_behavior::{patient}")
+        filter_class, filter_bin, filter_weekends = st.columns(3)
+        with filter_class:
+            selected_classification = st.selectbox("Classificação da análise",["Todas","C1","C2","NC"],key=f"abc_scope_classification::{patient}")
+        with filter_bin:
+            bin_minutes = st.selectbox("Faixa de horário (minutos)",[60,30,15],key=f"abc_scope_bin::{patient}")
+        with filter_weekends:
+            include_weekends = st.checkbox("Incluir finais de semana na análise",value=True,key=f"abc_scope_weekends::{patient}")
+    scope = {"data_inicio":analysis_start.isoformat(),"data_fim":analysis_end.isoformat(),
+             "faixa_minutos":bin_minutes,"incluir_finais_semana":include_weekends}
+    if analysis_environment != "Todos os ambientes": scope["ambiente"] = analysis_environment
+    if selected_behavior != "Todos": scope["comportamento"] = selected_behavior
+    if selected_classification != "Todas": scope["classificacao"] = selected_classification
+    st.session_state["abc_current_scope"]={"patient":patient,"params":scope}
     try:
-        excel_bytes, excel_name = load_abc_excel(patient)
-        with excel_col:
-            st.download_button(
-                "Baixar Excel do paciente",
-                data=excel_bytes,
-                file_name=excel_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with path_col:
-            st.caption(f"Cópia automática no projeto: {analysis_all.get('excel_path', '-')}")
-            st.caption("Após incluir, editar ou remover, a cópia é atualizada em segundo plano.")
-            st.caption("Arquivo de saída: alterações feitas no Excel não são importadas pela aplicação.")
+        analysis=load_abc_analysis(patient,None if analysis_environment=="Todos os ambientes" else analysis_environment,scoped=True)
     except Exception as exc:
-        st.warning(f"O Excel ainda não pôde ser disponibilizado: {exc}")
-
-    if total_all == 0:
-        st.markdown("### Imprimir análise ABC")
-        st.button(
-            "Preparar relatório ABC em Word e PDF",
-            type="primary",
-            use_container_width=True,
-            disabled=True,
-            key="abc_prepare_empty_prediction_report",
-        )
-        st.info(
-            "Ainda não há registros ABC para este paciente. Adicione o primeiro acontecimento para habilitar "
-            "os gráficos, as previsões e o relatório para impressão."
-        )
-        return
-
-    st.markdown("### Explorar os registros")
-    analysis_environment = st.selectbox(
-        "Ambiente da análise",
-        ["Todos os ambientes", *analysis_all.get("ambientes_observados", [])],
-        key="abc_analysis_environment",
-    )
-    if analysis_environment == "Todos os ambientes":
-        analysis = analysis_all
-    else:
-        try:
-            analysis = load_abc_analysis(patient, analysis_environment)
-        except Exception as exc:
-            st.error(f"Não foi possível aplicar o filtro de ambiente: {exc}")
-            return
-
+        st.error(f"Não foi possível aplicar o recorte: {exc}")
+        analysis = {}
+    temporal = analysis.get("distribuicao_temporal") or {}
     total = int(analysis.get("total_registros", 0))
-    if total == 0:
-        st.info("Não há registros para o ambiente selecionado.")
-        return
-
-    latest = (analysis.get("registros_recentes") or [{}])[0]
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        render_metric_card("Registros ABC", str(total), "intervalos observados")
-    with c2:
-        render_metric_card("Comportamentos", str(analysis.get("comportamentos_distintos", 0)), "categorias observadas")
-    with c3:
-        render_metric_card("Ambientes", str(analysis.get("ambientes_distintos", 0)), "contextos registrados")
-    with c4:
-        render_metric_card("Último registro", str(latest.get("data", "-")), str(latest.get("hora", "-")))
-
-    s1, s2, s3, s4 = st.columns(4)
-    with s1:
-        render_metric_card("C1 - leve", str(analysis.get("c1_leve", 0)), "sem critério de dano")
-    with s2:
-        render_metric_card("C2 - intenso", str(analysis.get("c2_intenso", 0)), "classificação de gravidade registrada")
-    with s3:
-        render_metric_card("Sem classificação", str(analysis.get("nao_classificados", 0)), "edite os registros históricos")
-    with s4:
-        render_metric_card("Funções", str(len(analysis.get("funcoes_observadas", []))), "hipóteses informadas")
-
-    report_chains = list(analysis.get("cadeias_completas") or [])
-    report_chain_names = [str(item.get("cadeia")) for item in report_chains if item.get("cadeia")]
-    report_chain_name = str(st.session_state.get("abc_selected_chain") or "")
-    if report_chain_name not in report_chain_names:
-        report_chain_name = report_chain_names[0] if report_chain_names else ""
-    report_chain = next(
-        (item for item in report_chains if str(item.get("cadeia")) == report_chain_name),
-        {},
+    st.caption(f"{analysis_start:%d/%m/%Y} a {analysis_end:%d/%m/%Y} · {analysis_environment} · {selected_behavior} · {selected_classification} · faixas de {bin_minutes} minutos · {total} episódios")
+    hours_tab, evolution_tab, contexts_tab, chains_tab, records_tab, reports_tab = st.tabs(
+        ["Horários", "Evolução", "Contextos", "Cadeias", "Registros", "Relatórios"]
     )
-
-    report_behaviors = list(analysis_all.get("comportamentos_observados") or [])
-    report_behavior = str(st.session_state.get("abc_prediction_behavior") or "")
-    if report_behavior not in report_behaviors:
-        report_behavior = report_behaviors[0] if report_behaviors else ""
-    report_antecedent = str(st.session_state.get("abc_prediction_antecedent") or "Qualquer antecedente")
-    if report_antecedent not in ["Qualquer antecedente", *analysis_all.get("antecedentes_observados", [])]:
-        report_antecedent = "Qualquer antecedente"
-    report_prediction_environment = str(st.session_state.get("abc_prediction_environment") or "Qualquer ambiente")
-    if report_prediction_environment not in ["Qualquer ambiente", *analysis_all.get("ambientes_observados", [])]:
-        report_prediction_environment = "Qualquer ambiente"
-    report_classification = str(st.session_state.get("abc_prediction_classification") or "Qualquer classificação")
-    if report_classification not in {"Qualquer classificação", "C1", "C2"}:
-        report_classification = "Qualquer classificação"
-    report_function = str(st.session_state.get("abc_prediction_function") or "Qualquer função")
-    if report_function not in ["Qualquer função", *analysis_all.get("funcoes_observadas", [])]:
-        report_function = "Qualquer função"
-
-    report_prediction = {}
-    if report_behavior:
-        try:
-            report_prediction = load_abc_prediction(
-                patient,
-                report_behavior,
-                None if report_antecedent == "Qualquer antecedente" else report_antecedent,
-                None if report_prediction_environment == "Qualquer ambiente" else report_prediction_environment,
-                None if report_classification == "Qualquer classificação" else report_classification,
-                None if report_function == "Qualquer função" else report_function,
-            )
-        except Exception:
-            report_prediction = {}
-
-    report_environments = list(analysis_all.get("ambientes_observados") or [])
-    report_risk_environment = str(st.session_state.get("abc_heatmap_environment") or "")
-    if report_risk_environment not in report_environments:
-        if analysis_environment != "Todos os ambientes" and analysis_environment in report_environments:
-            report_risk_environment = analysis_environment
-        else:
-            report_risk_environment = report_environments[0] if report_environments else ""
-
-    report_ai_environment = None if analysis_environment == "Todos os ambientes" else analysis_environment
-    report_ai_key = f"abc_functional_ai::{patient}::{report_chain_name}::{report_ai_environment or ''}"
-    report_ai_result = st.session_state.get(report_ai_key)
-
-    st.markdown("### Resumo ABC para impressão")
-    st.write(
-        "Gere o relatório descritivo completo para analistas do comportamento. O corpo apresenta a formulação clínica; "
-        "todas as cadeias e os indicadores técnicos permanecem nos apêndices."
-    )
-    report_date_values = pd.to_datetime(
-        [item.get("data") for item in analysis_all.get("serie_temporal", [])], errors="coerce"
-    )
-    report_date_values = report_date_values[~pd.isna(report_date_values)]
-    default_report_start = report_date_values.min().date() if len(report_date_values) else date.today()
-    default_report_end = report_date_values.max().date() if len(report_date_values) else date.today()
-
-    with st.container(border=True):
-        report_period = st.date_input(
-            "Selecionar período",
-            value=(default_report_start, default_report_end),
-            format="DD/MM/YYYY",
-            key="abc_print_report_period",
-        )
-        if isinstance(report_period, (tuple, list)) and len(report_period) == 2:
-            report_start_date, report_end_date = report_period
-        else:
-            report_start_date = report_end_date = report_period
-
-        report_chain_scope_label = st.radio(
-            "Cadeias A-B-C do mesmo registro",
-            ["Uma cadeia específica", "Todas as cadeias comportamentais"],
-            index=1,
-            horizontal=True,
-            key="abc_report_chain_scope",
-        )
-        report_chain_scope = "selected" if report_chain_scope_label == "Uma cadeia específica" else "all"
-        if report_chain_scope == "selected" and report_chain_names:
-            report_chain_name = st.selectbox(
-                "Cadeia para o relatório",
-                report_chain_names,
-                index=report_chain_names.index(report_chain_name) if report_chain_name in report_chain_names else 0,
-                key="abc_report_selected_chain",
-            )
-        elif report_chain_names:
-            reference_chain = max(report_chains, key=lambda item: int(item.get("suporte") or 0))
-            report_chain_name = str(reference_chain.get("cadeia") or "")
-            st.caption(
-                f"As {len(report_chain_names)} cadeias do recorte serão listadas. A mais frequente será apenas a referência visual."
-            )
-        else:
-            report_chain_name = ""
-            st.info("Ainda não há uma cadeia completa disponível neste recorte.")
-
-        chain_filter_col, identity_col = st.columns(2)
-        with chain_filter_col:
-            temporal_chain_filter = st.radio(
-                "Cadeias temporais",
-                ["Revisadas e candidatas", "Apenas revisadas e aceitas"],
-                key="abc_print_temporal_chain_filter",
-            )
-        with identity_col:
-            report_generated_by = st.text_input(
-                "Responsável pela geração",
-                value="Usuário local",
-                max_chars=160,
-                key="abc_print_generated_by",
-            )
-
-        option_col1, option_col2, option_col3 = st.columns(3)
-        with option_col1:
-            report_include_charts = st.toggle("Incluir gráficos", value=True, key="abc_print_include_charts")
-            report_include_weekends = st.toggle("Incluir finais de semana", value=True, key="abc_print_weekends")
-        with option_col2:
-            report_include_explanation = st.toggle(
-                "Incluir explicação do ABC fechado", value=True, key="abc_print_explanation"
-            )
-            report_include_limitations = st.toggle(
-                "Incluir limitações clínicas", value=True, key="abc_print_limitations"
-            )
-        with option_col3:
-            report_anonymize = st.toggle(
-                "Ocultar identificação do paciente", value=False, key="abc_print_anonymize"
-            )
-
-    report_chain = next(
-        (item for item in report_chains if str(item.get("cadeia")) == report_chain_name),
-        {},
-    )
-    report_ai_key = f"abc_functional_ai::{patient}::{report_chain_name}::{report_ai_environment or ''}"
-    report_ai_result = st.session_state.get(report_ai_key)
-    report_reviewed_only = temporal_chain_filter == "Apenas revisadas e aceitas"
-    report_include_candidates = not report_reviewed_only
-    report_environment_param = None if analysis_environment == "Todos os ambientes" else analysis_environment
-    report_state_key = "abc_prediction_report_" + str(
-        hash(
-            (
-                patient,
-                report_start_date,
-                report_end_date,
-                analysis_environment,
-                report_chain_scope,
-                report_chain_name,
-                report_reviewed_only,
-                report_include_charts,
-                report_include_weekends,
-                report_include_explanation,
-                report_include_limitations,
-                report_anonymize,
-                report_generated_by,
-                total,
-            )
-        )
-    )
-    preview_state_key = f"{report_state_key}_preview"
-    preview_col, print_col = st.columns(2)
-    with preview_col:
-        preview_clicked = st.button(
-            "Visualizar resumo",
-            use_container_width=True,
-            key="abc_preview_printable_summary",
-        )
-    with print_col:
-        print_clicked = st.button(
-            "Imprimir resumo ABC",
-            type="primary",
-            use_container_width=True,
-            key="abc_prepare_prediction_report",
-        )
-
-    if preview_clicked or print_clicked:
-        try:
-            with st.spinner("Preparando o resumo clínico ABC..."):
-                report_summary = load_abc_report_summary(
-                    patient,
-                    start_date=report_start_date,
-                    end_date=report_end_date,
-                    environment=report_environment_param,
-                    include_weekends=report_include_weekends,
-                    include_candidate_chains=report_include_candidates,
-                    reviewed_chains_only=report_reviewed_only,
-                    include_charts=report_include_charts,
-                    anonymize_patient=report_anonymize,
-                    generated_by=report_generated_by or "Usuário local",
-                    output_format="pdf" if print_clicked else "preview",
-                )
-                st.session_state[preview_state_key] = report_summary
-                if print_clicked:
-                    try:
-                        report_temporal_data = load_abc_temporal_chains(patient)
-                    except Exception:
-                        report_temporal_data = {"candidates": [], "stats": [], "matrix": [], "timeline": []}
-                    filtered_analysis = report_summary.get("analysis") or analysis
-                    filtered_chains = list(filtered_analysis.get("cadeias_completas") or [])
-                    filtered_chain = next(
-                        (item for item in filtered_chains if str(item.get("cadeia")) == report_chain_name),
-                        max(filtered_chains, key=lambda item: int(item.get("suporte") or 0)) if filtered_chains else {},
-                    )
-                    filtered_observation = report_summary.get("observation_summary") or {}
-                    filtered_behavior = (report_summary.get("most_frequent") or {}).get("behavior") or {}
-                    filtered_total = int(filtered_analysis.get("total_registros") or filtered_observation.get("total_records") or 0)
-                    filtered_behavior_count = int(filtered_behavior.get("quantidade") or 0)
-                    report_prediction_for_period = {
-                        **report_prediction,
-                        "analysis_mode": "descriptive",
-                        "comportamento": filtered_behavior.get("nome") or report_prediction.get("comportamento") or "-",
-                        "numerador": filtered_behavior_count,
-                        "denominador": filtered_total,
-                        "estimativa_descritiva": (filtered_behavior_count / filtered_total) if filtered_total else None,
-                        "metodo": "proporção descritiva do recorte filtrado",
-                        "intervalo_agrupado_sessao": report_summary.get("top_behavior_session_cluster_interval") or {},
-                    }
-                    report_payload = {
-                        "patient": report_summary.get("patient", {}).get("display_name") or patient,
-                        "environment": analysis_environment,
-                        "risk_environment": report_risk_environment,
-                        "analysis": filtered_analysis,
-                        "analysis_all": filtered_analysis,
-                        "chain_scope": report_chain_scope,
-                        "selected_chain": filtered_chain,
-                        "prediction": report_prediction_for_period,
-                        "temporal_data": report_temporal_data,
-                        "report_summary": report_summary,
-                        "include_charts": report_include_charts,
-                        "include_abc_explanation": report_include_explanation,
-                        "include_limitations": report_include_limitations,
-                        "ai_result": report_ai_result,
-                    }
-                    report_docx_bytes = build_abc_report_docx(report_payload)
-                    st.session_state[report_state_key] = {
-                        "docx": report_docx_bytes,
-                        "pdf": build_abc_report_pdf_from_docx(report_docx_bytes),
-                    }
-        except Exception as exc:
-            st.error(f"Não foi possível preparar o resumo ABC: {exc}")
-
-    report_preview = st.session_state.get(preview_state_key)
-    if report_preview:
-        st.markdown("#### Pré-visualização do resumo")
-        st.write(report_preview.get("descriptive_summary") or "Sem resumo disponível.")
-        preview_observation = report_preview.get("observation_summary") or {}
-        preview_quality = report_preview.get("data_quality") or {}
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Sessões", int(preview_observation.get("sessions") or 0))
-        p2.metric("Intervalos observados", int(preview_observation.get("observed_intervals") or 0))
-        p3.metric("Cobertura", f"{float(preview_observation.get('coverage') or 0) * 100:.1f}%")
-        p4.metric("Qualidade", str(preview_quality.get("status") or "insuficiente").capitalize())
-        for warning in preview_quality.get("warnings") or []:
-            st.warning(warning)
-        st.caption(report_preview.get("clinical_disclaimer") or "")
-
-    generated_abc_report = st.session_state.get(report_state_key)
-    if generated_abc_report:
-        st.success("Resumo ABC pronto para salvar ou imprimir.")
-        report_filename_patient = "Paciente_anonimizado" if report_anonymize else patient
-        report_word_col, report_pdf_col = st.columns(2)
-        with report_word_col:
-            st.download_button(
-                "Baixar Word ABC",
-                data=generated_abc_report["docx"],
-                file_name=abc_report_filename(report_filename_patient, "docx"),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
-        with report_pdf_col:
-            st.download_button(
-                "Salvar como PDF",
-                data=generated_abc_report["pdf"],
-                file_name=abc_report_filename(report_filename_patient, "pdf"),
-                mime="application/pdf",
-                use_container_width=True,
-            )
-    st.caption(
-        "Use “Imprimir resumo ABC” para gerar o Word e o PDF completos. A prévia é apenas uma síntese na tela. "
-        "Gere novamente após alterar período ou opções."
-    )
-
-    series = pd.DataFrame(analysis.get("serie_temporal", []))
-    if not series.empty:
-        series["data_exibicao"] = pd.to_datetime(series["data"], errors="coerce").dt.strftime("%d/%m/%Y")
-        date_order = series.drop_duplicates("data").sort_values("data")["data_exibicao"].tolist()
-        fig = go.Figure()
-        colors = ["#c17c74", "#7d9b76", "#6f86a4", "#b58a55", "#8a7a9d", "#6f9b96"]
-        for index, behavior_name in enumerate(series["comportamento"].drop_duplicates()):
-            item = series[series["comportamento"] == behavior_name]
-            fig.add_trace(
-                go.Bar(
-                    x=item["data_exibicao"],
-                    y=item["quantidade"],
-                    name=behavior_name,
-                    marker_color=colors[index % len(colors)],
-                )
-            )
-        fig.update_layout(
-            title="Frequência de comportamentos por data",
-            xaxis_title="Data",
-            yaxis_title="Quantidade de registros",
-            barmode="stack",
-        )
-        fig.update_xaxes(type="category", categoryorder="array", categoryarray=date_order)
-        st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-
-    timeline = pd.DataFrame(analysis.get("linha_tempo", []))
-    if not timeline.empty:
-        timeline["data_hora"] = pd.to_datetime(timeline["data_hora"], errors="coerce")
-        fig = go.Figure()
-        timeline_colors = ["#c17c74", "#7d9b76", "#6f86a4", "#b58a55", "#8a7a9d", "#6f9b96"]
-        for index, environment_name in enumerate(timeline["ambiente"].drop_duplicates()):
-            item = timeline[timeline["ambiente"] == environment_name]
-            fig.add_trace(
-                go.Scatter(
-                    x=item["data_hora"],
-                    y=item["cadeia"],
-                    mode="markers",
-                    name=environment_name,
-                    marker=dict(
-                        size=13,
-                        color=timeline_colors[index % len(timeline_colors)],
-                        symbol=item["classificacao"].map(
-                            {"C1 - leve": "circle", "C2 - intenso": "triangle-up", "Não classificado": "x"}
-                        ).fillna("x"),
-                        line=dict(width=1, color="#fffaf2"),
-                    ),
-                    customdata=item[["hora", "ambiente", "classificacao", "funcao"]],
-                    hovertemplate=(
-                        "%{y}<br>%{customdata[0]}<br>%{customdata[1]}<br>"
-                        "%{customdata[2]}<br>Função: %{customdata[3]}<extra></extra>"
-                    ),
-                )
-            )
-        fig.update_layout(title="Linha do tempo das cadeias por segundo", xaxis_title="Data e hora", yaxis_title="Cadeia A-B-C")
-        fig.update_xaxes(tickformat="%d/%m/%Y<br>%H:%M:%S")
-        st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-
-    antecedent_associations = pd.DataFrame(analysis.get("antecedente_comportamento", []))
-    consequence_associations = pd.DataFrame(analysis.get("comportamento_consequencia", []))
-    chart_left, chart_right = st.columns(2)
-    with chart_left:
-        if not antecedent_associations.empty:
-            view = antecedent_associations.head(10).copy()
-            view["associacao"] = view["antecedente"] + " -> " + view["comportamento"]
-            view["probabilidade"] = view["probabilidade_condicional"] * 100
-            fig = go.Figure(
-                go.Bar(
-                    x=view["probabilidade"],
-                    y=view["associacao"],
-                    orientation="h",
-                    marker_color=PASTEL_SKILL,
-                    customdata=view[["suporte", "lift"]],
-                    hovertemplate="P(B|A)=%{x:.1f}%<br>n=%{customdata[0]}<br>lift=%{customdata[1]:.2f}<extra></extra>",
-                )
-            )
-            fig.update_layout(title="P(comportamento | antecedente)", xaxis_title="Probabilidade condicional (%)", yaxis_title="")
-            fig.update_xaxes(range=[0, 100])
-            st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-    with chart_right:
-        if not consequence_associations.empty:
-            view = consequence_associations.head(10).copy()
-            view["associacao"] = view["comportamento"] + " -> " + view["consequencia"]
-            view["probabilidade"] = view["probabilidade_condicional"] * 100
-            fig = go.Figure(
-                go.Bar(
-                    x=view["probabilidade"],
-                    y=view["associacao"],
-                    orientation="h",
-                    marker_color=PASTEL_BEHAVIOR,
-                    customdata=view[["suporte", "lift"]],
-                    hovertemplate="P(C|B)=%{x:.1f}%<br>n=%{customdata[0]}<br>lift=%{customdata[1]:.2f}<extra></extra>",
-                )
-            )
-            fig.update_layout(title="P(consequencia | comportamento)", xaxis_title="Probabilidade condicional (%)", yaxis_title="")
-            fig.update_xaxes(range=[0, 100])
-            st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-
-    environments = pd.DataFrame(analysis.get("por_ambiente", []))
-    if not environments.empty:
-        fig = go.Figure(
-            go.Bar(
-                x=environments["ambiente"],
-                y=environments["quantidade"],
-                marker_color=PASTEL_FORECAST,
-            )
-        )
-        fig.update_layout(title="Distribuição dos registros por ambiente", xaxis_title="Ambiente", yaxis_title="Registros")
-        st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-
-    severity_data = pd.DataFrame(analysis.get("por_classificacao", []))
-    function_data = pd.DataFrame(analysis.get("por_funcao", []))
-    severity_chart, function_chart = st.columns(2)
-    with severity_chart:
-        if not severity_data.empty:
-            severity_data["rotulo"] = severity_data["classificacao"].map(
-                {"C1": "C1 - leve", "C2": "C2 - intenso", "NC": "Não classificado"}
-            ).fillna(severity_data["classificacao"])
-            severity_colors = severity_data["classificacao"].map(
-                {"C1": "#7d9b76", "C2": "#c17c74", "NC": "#9b948b"}
-            ).fillna("#9b948b")
-            fig = go.Figure(
-                go.Bar(
-                    x=severity_data["rotulo"],
-                    y=severity_data["quantidade"],
-                    marker_color=severity_colors,
-                )
-            )
-            fig.update_layout(title="Classificação dos interferentes", xaxis_title="Nível", yaxis_title="Registros")
-            st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-    with function_chart:
-        if not function_data.empty:
-            fig = go.Figure(
-                go.Bar(
-                    x=function_data["quantidade"],
-                    y=function_data["funcao"],
-                    orientation="h",
-                    marker_color="#6f86a4",
-                )
-            )
-            fig.update_layout(title="Funções informadas", xaxis_title="Registros", yaxis_title="")
-            st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-
-    st.markdown("### Mapa de frequência e gravidade configurada por local")
-    st.caption(
-        "O eixo X mostra a frequência observada da cadeia; o eixo Y mostra o peso médio configurado de gravidade. "
-        "O tamanho do ponto representa suporte. C1/C2 são categorias registradas, não probabilidades clínicas."
-    )
-    map_environment = st.selectbox(
-        "Local do mapa de calor",
-        analysis_all.get("ambientes_observados", []),
-        key="abc_heatmap_environment",
-    )
-    risk_map = pd.DataFrame(analysis_all.get("mapa_risco", []))
-    if not risk_map.empty:
-        risk_map = risk_map[risk_map["ambiente"] == map_environment].copy()
-    if risk_map.empty:
-        st.info("Ainda não há cadeias suficientes no local selecionado para montar o mapa de risco.")
-    else:
-        risk_map["ocorrencia_pct"] = risk_map["probabilidade_ocorrencia"] * 100
-        severity_column = "peso_medio_gravidade" if "peso_medio_gravidade" in risk_map.columns else "indice_perigo"
-        risk_map["gravidade_configurada"] = risk_map[severity_column].fillna(0)
-        max_support = max(1, int(risk_map["suporte"].max()))
-        risk_map["tamanho"] = 14 + (risk_map["suporte"] / max_support) * 18
-        fig = go.Figure()
-        quadrant_specs = [
-            (0, 50, 0, 0.5, "rgba(188, 216, 190, 0.30)", "Menor frequência / menor peso"),
-            (0, 50, 0.5, 1.0, "rgba(236, 197, 178, 0.28)", "Menor frequência / maior peso"),
-            (50, 100, 0, 0.5, "rgba(235, 220, 164, 0.30)", "Maior frequência / menor peso"),
-            (50, 100, 0.5, 1.0, "rgba(207, 137, 130, 0.28)", "Maior frequência / maior peso"),
-        ]
-        for x0, x1, y0, y1, color, label in quadrant_specs:
-            fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1, fillcolor=color, line_width=0, layer="below")
-            fig.add_annotation(
-                x=(x0 + x1) / 2,
-                y=y1 - 0.05,
-                text=label,
-                showarrow=False,
-                font=dict(size=11, color="#5d5145"),
-                bgcolor="rgba(255,253,248,0.74)",
-            )
-        symbol_specs = {
-            "C1": ("circle", "#587957", "C1 - leve"),
-            "C2": ("triangle-up", "#a94f49", "C2 - intenso"),
-            "NC": ("x", "#6f6b66", "Não classificado"),
-        }
-        for classification_code, (symbol, color, label) in symbol_specs.items():
-            item = risk_map[risk_map["classificacao_predominante"] == classification_code]
-            if item.empty:
-                continue
-            fig.add_trace(
-                go.Scatter(
-                    x=item["ocorrencia_pct"],
-                    y=item["gravidade_configurada"],
-                    mode="markers+text",
-                    name=label,
-                    text=item["comportamento"],
-                    textposition="top center",
-                    textfont=dict(size=10, color="#33291f"),
-                    marker=dict(
-                        symbol=symbol,
-                        size=item["tamanho"],
-                        color=color,
-                        line=dict(color="#fffdf8", width=2),
-                        opacity=0.92,
-                    ),
-                    customdata=item[["cadeia", "funcao", "suporte", "c1_leve", "c2_intenso", "nao_classificado"]],
-                    hovertemplate=(
-                        "%{customdata[0]}<br>Função: %{customdata[1]}<br>"
-                        "Frequência no local: %{x:.1f}%<br>Peso médio configurado: %{y:.2f}<br>"
-                        "n=%{customdata[2]} | C1=%{customdata[3]} | C2=%{customdata[4]} | sem classe=%{customdata[5]}"
-                        "<extra></extra>"
-                    ),
-                )
-            )
-        fig.add_vline(x=50, line_width=1, line_dash="dash", line_color="#8f8171")
-        fig.add_hline(y=0.5, line_width=1, line_dash="dash", line_color="#8f8171")
-        fig.update_layout(
-            title=f"Frequência observada × peso de gravidade em {map_environment}",
-            xaxis_title="Frequência observada da cadeia no local (%)",
-            yaxis_title="Peso médio configurado de gravidade",
-            hovermode="closest",
-            legend_title="Classificação predominante",
-            height=620,
-        )
-        fig.update_xaxes(range=[-2, 102], dtick=10)
-        fig.update_yaxes(range=[-0.02, 1.02], dtick=0.1)
-        st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
-        if int(risk_map["nao_classificado"].sum()) > 0:
-            st.info("Há registros oficiais sem C1/C2. Eles permanecem contabilizados separadamente e reduzem a qualidade da evidência.")
-
-    chains = pd.DataFrame(analysis.get("cadeias_completas", []))
-    selected_chain_row = None
-    selected_chain = None
-    if not chains.empty:
-        selected_chain = st.selectbox(
-            "Cadeia completa para análise detalhada",
-            chains["cadeia"].tolist(),
-            key="abc_selected_chain",
-        )
-        selected_chain_row = chains[chains["cadeia"] == selected_chain].iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
+    with records_tab:
+        add_record_tab, history_tab, observation_tab = st.tabs(["Adicionar", "Histórico", "Tempo observado"])
+    with add_record_tab:
+        st.markdown("### Registrar acontecimento")
+        c1, c2, c3 = st.columns(3)
         with c1:
-            render_metric_card("P(A-B-C)", pct(float(selected_chain_row["probabilidade_conjunta"]) * 100), "frequência conjunta observada")
+            antecedent = st.selectbox("Antecedente", antecedent_labels, key="abc_antecedent")
+            new_antecedent = ""
+            if antecedent == NEW_ABC_OPTION:
+                new_antecedent = st.text_input(
+                    "Digite o novo antecedente",
+                    max_chars=200,
+                    placeholder="Ex.: mudança inesperada",
+                    key="abc_new_antecedent",
+                )
         with c2:
-            render_metric_card("P(B | A)", pct(float(selected_chain_row["probabilidade_comportamento_dado_antecedente"]) * 100), "comportamento após antecedente")
+            behavior = st.selectbox("Comportamento", behavior_labels, index=None, placeholder="Selecione o comportamento observado", key="abc_behavior")
+            new_behavior = ""
+            if behavior == NEW_ABC_OPTION:
+                new_behavior = st.text_input(
+                    "Digite o novo comportamento",
+                    max_chars=200,
+                    placeholder="Ex.: jogar material no chão",
+                    key="abc_new_behavior",
+                )
         with c3:
-            render_metric_card("P(C | A,B)", pct(float(selected_chain_row["probabilidade_consequencia_dada_cadeia_ab"]) * 100), "consequência após A-B")
+            consequence = st.selectbox("Consequência", consequence_labels, key="abc_consequence")
+            new_consequence = ""
+            if consequence == NEW_ABC_OPTION:
+                new_consequence = st.text_input(
+                    "Digite a nova consequência",
+                    max_chars=200,
+                    placeholder="Ex.: retirada da atividade",
+                    key="abc_new_consequence",
+                )
+
+        default_environments = ["Sala de terapia", "Sala de aula", "Casa", "Refeitório", "Área externa"]
+        observed_environments = analysis_all.get("ambientes_observados", [])
+        environment_options = list(dict.fromkeys([*default_environments, *observed_environments]))
+        new_environment_option = "Digitar novo ambiente..."
+        environment_options.append(new_environment_option)
+
+        c4, c5, c6, c7 = st.columns([1, 1, 0.65, 1.2])
         with c4:
-            render_metric_card("Suporte", str(int(selected_chain_row["suporte"])), "cadeias completas observadas")
-
-        risk_c1, risk_c2, risk_c3 = st.columns(3)
-        with risk_c1:
-            render_metric_card("C1 - leve", str(int(selected_chain_row.get("c1_leve", 0))), "na cadeia selecionada")
-        with risk_c2:
-            render_metric_card("C2 - intenso", str(int(selected_chain_row.get("c2_intenso", 0))), "na cadeia selecionada")
-        with risk_c3:
-            render_metric_card(
-                "Hipótese mais registrada",
-                str(selected_chain_row.get("funcao_predominante", "Não informada")),
-                f"peso médio configurado = {float(selected_chain_row.get('peso_medio_gravidade') or selected_chain_row.get('indice_perigo') or 0):.2f}",
+            record_date = st.date_input(
+                "Data do acontecimento",
+                value=None,
+                format="DD/MM/YYYY",
+                key="abc_record_date",
             )
-
-        chain_table = chains.rename(
-            columns={
-                "cadeia": "Cadeia A-B-C",
-                "suporte": "n",
-                "probabilidade_conjunta": "P(A-B-C)",
-                "probabilidade_comportamento_dado_antecedente": "P(B|A)",
-                "probabilidade_consequencia_dada_cadeia_ab": "P(C|A,B)",
-                "lift_conjunto": "Lift conjunto",
-                "c1_leve": "C1",
-                "c2_intenso": "C2",
-                "indice_perigo": "Peso médio configurado",
-                "funcao_predominante": "Função",
-            }
-        )
-        render_html_table(
-            chain_table,
-            ["Cadeia A-B-C", "Função", "C1", "C2", "Peso médio configurado", "n", "P(A-B-C)", "P(B|A)", "P(C|A,B)", "Lift conjunto"],
-            {
-                "P(A-B-C)": lambda value: pct(float(value) * 100),
-                "P(B|A)": lambda value: pct(float(value) * 100),
-                "P(C|A,B)": lambda value: pct(float(value) * 100),
-                "Peso médio configurado": lambda value: "-" if pd.isna(value) else f"{float(value):.2f}",
-                "Lift conjunto": lambda value: "-" if pd.isna(value) else f"{float(value):.2f}",
-            },
-            max_rows=12,
-        )
-
-    st.markdown("### Estimativa descritiva em registros semelhantes")
-    st.caption(
-        "Os registros legados são oficiais e entram no cálculo após normalização auditável. Como a base contém episódios, "
-        "mas não todas as oportunidades negativas observáveis, esta seção não estima o risco absoluto do próximo registro."
-    )
-    prediction_formula_blocks: list[tuple[str, str, str]] = []
-    prediction_behaviors = analysis_all.get("comportamentos_observados", [])
-    if prediction_behaviors:
-        p1, p2, p3 = st.columns(3)
-        with p1:
-            prediction_behavior = st.selectbox("Comportamento a descrever", prediction_behaviors, key="abc_prediction_behavior")
-        with p2:
-            prediction_antecedent = st.selectbox(
-                "Antecedente do recorte",
-                ["Qualquer antecedente", *analysis_all.get("antecedentes_observados", [])],
-                key="abc_prediction_antecedent",
+        with c5:
+            record_time_text = st.text_input(
+                "Hora e minuto",
+                value="",
+                placeholder="Ex.: 9:30, 0930 ou 9h30",
+                help="Ao digitar, o horário é interpretado automaticamente.",
+                key="abc_record_time",
             )
-        with p3:
-            prediction_environment = st.selectbox(
-                "Ambiente do recorte",
-                ["Qualquer ambiente", *analysis_all.get("ambientes_observados", [])],
-                key="abc_prediction_environment",
+        with c6:
+            record_second = st.number_input(
+                "Segundo",
+                min_value=0,
+                max_value=59,
+                value=0,
+                step=1,
+                disabled=st.session_state.get("abc_time_precision", "Minuto informado") != "Segundo informado",
+                key="abc_record_second",
             )
-        p4, p5 = st.columns(2)
-        with p4:
-            prediction_classification = st.selectbox(
-                "Classificação para estratificação",
-                ["Qualquer classificação", "C1", "C2"],
-                key="abc_prediction_classification",
-            )
-        with p5:
-            prediction_function = st.selectbox(
-                "Hipótese registrada para estratificação",
-                ["Qualquer função", *analysis_all.get("funcoes_observadas", [])],
-                key="abc_prediction_function",
-            )
-        try:
-            prediction = load_abc_prediction(
-                patient,
-                prediction_behavior,
-                None if prediction_antecedent == "Qualquer antecedente" else prediction_antecedent,
-                None if prediction_environment == "Qualquer ambiente" else prediction_environment,
-                None if prediction_classification == "Qualquer classificação" else prediction_classification,
-                None if prediction_function == "Qualquer função" else prediction_function,
-            )
-            c1, c2, c3, c4 = st.columns(4)
-            descriptive_value = prediction.get("estimativa_descritiva", prediction.get("probabilidade_prevista"))
-            with c1:
-                render_metric_card("Frequência observada", pct(float(descriptive_value) * 100) if descriptive_value is not None else "-", prediction_behavior)
-            with c2:
-                render_metric_card("k / n", f"{int(prediction.get('numerador') or 0)} / {int(prediction.get('denominador') or 0)}", "episódios registrados")
-            with c3:
-                render_metric_card(
-                    "IC de Wilson",
-                    f"{pct(float(prediction['intervalo_wilson_inferior']) * 100)}–{pct(float(prediction['intervalo_wilson_superior']) * 100)}" if prediction.get("intervalo_wilson_inferior") is not None else "-",
-                    "proporção binomial bruta",
+        with c7:
+            environment_option = st.selectbox("Ambiente", environment_options, key="abc_environment")
+            custom_environment = ""
+            if environment_option == new_environment_option:
+                custom_environment = st.text_input(
+                    "Digite o novo ambiente",
+                    max_chars=160,
+                    placeholder="Ex.: pátio coberto",
+                    key="abc_new_environment",
                 )
-            with c4:
-                render_metric_card("Qualidade", str(prediction.get("qualidade_evidencia", "inicial")), "regras auditáveis")
 
-            e1, e2, e3 = st.columns(3)
-            with e1:
-                render_metric_card("Histórico observado", pct(float(prediction["probabilidade_baseline"]) * 100), f"n total = {prediction.get('amostra_total', 0)}")
-            with e2:
-                context_value = prediction.get("probabilidade_contexto")
-                render_metric_card("Contexto A + ambiente", pct(float(context_value) * 100) if context_value is not None else "-", f"n contexto = {prediction.get('amostra_contexto', 0)}")
-            with e3:
-                render_metric_card("Modo analítico", "Descritivo", "risco absoluto indisponível")
+        precision_labels = {"Minuto informado": "minute", "Segundo informado": "second",
+                            "Horário aproximado": "approximate", "Horário não informado": "unknown"}
+        precision_label = st.selectbox("Precisão do horário na fonte", list(precision_labels), key="abc_time_precision")
+        record_precision = precision_labels[precision_label]
+        if record_precision != "second":
+            record_second = 0
+        with st.expander("Informações da folha e do atendimento"):
+            source_reference = st.text_input("Referência da folha / linha", max_chars=200, key="abc_source_reference")
+            observer = st.text_input("Quem observou", max_chars=160, key="abc_observer")
+            appointment_reference = st.text_input("Identificação do atendimento (opcional)", max_chars=160, key="abc_appointment")
+            frequency = st.number_input("Quantidade de respostas nesse episódio", min_value=1, max_value=100000, value=1, step=1, key="abc_frequency")
+            duration_known = st.checkbox("A duração do comportamento foi medida", key="abc_duration_known")
+            duration_seconds = st.number_input("Duração em segundos", min_value=0.0, key="abc_duration") if duration_known else None
+        confirm_duplicate = st.checkbox("Conferi o histórico: um episódio semelhante, se existir, é outro acontecimento", key="abc_confirm_duplicate")
 
-            prediction_formula_blocks = [
-                (
-                    "Estimativa frequencista",
-                    "p = k / n; IC = intervalo de Wilson para a proporção binomial bruta.",
-                    "Numerador, denominador, método e nível do intervalo são exibidos e reproduzíveis.",
-                ),
-                (
-                    "Limite do estimando",
-                    "Estimando = distribuição relativa entre episódios ABC registrados.",
-                    "A ausência de registro não é convertida em ausência de comportamento nem em exemplo negativo.",
-                ),
-                (
-                    "Uso clínico",
-                    "Associação não demonstra causalidade nem confirma função comportamental.",
-                    "O resultado não substitui avaliação funcional ou julgamento clínico individualizado.",
-                ),
-            ]
-        except Exception as exc:
-            st.warning(f"A estimativa descritiva ABC ainda não pôde ser calculada: {exc}")
-
-    with st.expander("Expandir análise funcional exploratória"):
-        st.markdown(
-            "Esta leitura organiza padrões de antecedente, comportamento, consequência, ambiente e tempo. Ela pode orientar hipóteses para avaliação funcional, mas não determina a função do comportamento."
+        st.markdown("#### Classificação do comportamento interferente")
+        st.caption("Conforme a regra definida pelo responsável, classificações não informadas são consideradas C1. A origem dessa atribuição fica registrada na auditoria.")
+        severity_col, function_col = st.columns([1, 1.4])
+        with severity_col:
+            classification_label = st.radio(
+                "Nível observado",
+                ["Não informado", "C1 - leve", "C2 - intenso"],
+                horizontal=True,
+                key="abc_classification",
+                help="C1: sem lesão, sangramento ou direção a ponto vital. C2: ao menos um desses critérios ocorreu.",
+            )
+        function_options = list(
+            dict.fromkeys(
+                [
+                    *ABC_FUNCTIONS,
+                    *[
+                        item
+                        for item in analysis_all.get("funcoes_observadas", [])
+                        if item and item != "Não informada"
+                    ],
+                    NEW_FUNCTION_OPTION,
+                ]
+            )
         )
-        if selected_chain_row is not None:
-            chain_environment = pd.DataFrame(analysis_all.get("cadeias_por_ambiente", []))
-            chain_environment = chain_environment[chain_environment["cadeia"] == selected_chain_row["cadeia"]]
-            if not chain_environment.empty:
-                chain_environment = chain_environment.rename(
-                    columns={
-                        "ambiente": "Ambiente",
-                        "suporte": "n",
-                        "total_ambiente": "Registros no ambiente",
-                        "probabilidade_no_ambiente": "P(cadeia|ambiente)",
-                        "funcao_predominante": "Função",
-                        "c1_leve": "C1",
-                        "c2_intenso": "C2",
-                        "indice_perigo": "Peso médio configurado",
-                    }
+        with function_col:
+            function_option = st.selectbox(
+                "Função informada (hipótese funcional)",
+                function_options,
+                key="abc_function",
+            )
+            custom_function = ""
+            if function_option == NEW_FUNCTION_OPTION:
+                custom_function = st.text_input(
+                    "Digite a função ou hipótese",
+                    max_chars=120,
+                    placeholder="Ex.: acesso a atenção de pares",
+                    key="abc_new_function",
                 )
-                render_html_table(
-                    chain_environment,
-                    ["Ambiente", "Função", "C1", "C2", "Peso médio configurado", "n", "Registros no ambiente", "P(cadeia|ambiente)"],
-                    {
-                        "P(cadeia|ambiente)": lambda value: pct(float(value) * 100),
-                        "Peso médio configurado": lambda value: "-" if pd.isna(value) else f"{float(value):.2f}",
-                    },
+
+        caused_injury = False
+        bleeding = False
+        targeted_vital_point = False
+        if classification_label.startswith("C2"):
+            st.caption("Marque ao menos um critério observado para classificar como C2 - intenso.")
+            criterion_1, criterion_2, criterion_3 = st.columns(3)
+            with criterion_1:
+                caused_injury = st.checkbox("Machucou ou feriu", key="abc_caused_injury")
+            with criterion_2:
+                bleeding = st.checkbox("Houve sangramento", key="abc_bleeding")
+            with criterion_3:
+                targeted_vital_point = st.checkbox(
+                    "Direcionado a ponto vital",
+                    key="abc_targeted_vital_point",
                 )
-        st.markdown("#### Leitura assistida por IA")
-        st.caption(
-            "A IA recebe um resumo desidentificado dos registros e compara hipóteses concorrentes. "
-            "O nome do paciente não é enviado ao provedor externo."
-        )
-        ai_question = st.text_area(
-            "Pergunta ou foco para a IA (opcional)",
-            placeholder=(
-                "Ex.: compare fuga/esquiva e atenção social e diga quais dados ainda faltam para diferenciá-las."
-            ),
-            height=90,
-            key="abc_functional_ai_question",
-        )
-        ai_environment = None if analysis_environment == "Todos os ambientes" else analysis_environment
-        ai_state_key = f"abc_functional_ai::{patient}::{selected_chain or ''}::{ai_environment or ''}"
-        if st.button(
-            "Gerar leitura funcional com IA",
+        elif classification_label.startswith("C1"):
+            st.caption("C1 - leve: não machucou, não feriu, não sangrou e não foi direcionado a ponto vital.")
+
+        submitted = st.button(
+            "Adicionar acontecimento ABC",
             type="primary",
             use_container_width=True,
-            key="abc_generate_functional_ai",
-        ):
-            try:
-                with st.spinner("Comparando padrões, hipóteses e limites da amostra..."):
-                    st.session_state[ai_state_key] = load_abc_functional_ai(
-                        patient,
-                        chain=selected_chain,
-                        environment=ai_environment,
-                        question=ai_question,
-                    )
-            except Exception as exc:
-                st.error(f"A leitura por IA não pôde ser gerada: {exc}")
+            key="abc_add_record",
+        )
 
-        ai_result = st.session_state.get(ai_state_key)
-        if ai_result:
-            mode = str(ai_result.get("modo") or "indisponível")
-            model = str(ai_result.get("modelo") or "")
-            if mode in {"limite_ia", "busca_local_fallback", "sem_provedor"}:
-                st.warning(str(ai_result.get("resposta") or "A IA não respondeu neste momento."))
+        if submitted:
+            environment = custom_environment.strip() if environment_option == new_environment_option else environment_option
+            selected_function = custom_function.strip() if function_option == NEW_FUNCTION_OPTION else function_option
+            if record_date is None:
+                st.error("Informe a data do acontecimento.")
+            elif not behavior:
+                st.error("Selecione o comportamento observado.")
+            elif not environment:
+                st.error("Informe o ambiente antes de adicionar.")
+            elif not selected_function:
+                st.error("Informe a função ou hipótese funcional.")
+            elif classification_label.startswith("C2") and not (
+                caused_injury or bleeding or targeted_vital_point
+            ):
+                st.error("C2 exige ao menos um critério objetivo de intensidade.")
             else:
-                st.markdown(str(ai_result.get("resposta") or ""))
-            provider_label = f"Provedor: {mode}"
-            if model:
-                provider_label += f" | Modelo: {model}"
-            st.caption(f"{provider_label} | Dados desidentificados: sim")
-            sources = list(ai_result.get("fontes") or [])
-            if sources and st.toggle("Mostrar fontes locais consultadas", key=f"abc_ai_sources_{ai_state_key}"):
-                for index, source in enumerate(sources, start=1):
-                    st.markdown(
-                        f"**Fonte {index}:** {source.get('titulo') or 'Trecho sem título'}  \n"
-                        f"Arquivo: `{source.get('fonte', '-')}`"
+                try:
+                    antecedent_code = _resolve_abc_code(
+                        patient, antecedent, new_antecedent, "antecedente", antecedent_codes
+                    ) if antecedent != "Não informado" else None
+                    behavior_code = _resolve_abc_code(
+                        patient, behavior, new_behavior, "comportamento", behavior_codes
                     )
-        st.info(
-            "Para concluir uma avaliação funcional, combine estes padrões com definição operacional, medidas de oportunidade, observação direta, concordância entre observadores e, quando indicado, procedimentos funcionais conduzidos por profissional habilitado."
+                    consequence_code = _resolve_abc_code(
+                        patient, consequence, new_consequence, "consequencia", consequence_codes
+                    ) if consequence != "Não informado" else None
+                    parsed_record_time = parse_hour_minute_text(record_time_text) if record_precision != "unknown" else None
+                    save_result = save_abc_record(
+                        patient,
+                        {
+                            "antecedente_codigo": antecedent_code if antecedent != "Não informado" else None,
+                            "comportamento_codigo": behavior_code,
+                            "consequencia_codigo": consequence_code if consequence != "Não informado" else None,
+                            "data": record_date.isoformat(),
+                            "hora": parsed_record_time.replace(second=int(record_second)).strftime("%H:%M:%S") if parsed_record_time else None,
+                            "precisao_horario": record_precision,
+                            "frequencia": int(frequency), "duracao_segundos": duration_seconds,
+                            "fonte_referencia": source_reference, "observador": observer,
+                            "atendimento_referencia": appointment_reference, "confirmar_duplicado": confirm_duplicate,
+                            "ambiente": environment,
+                            "classificacao": classification_label[:2] if classification_label.startswith(("C1", "C2")) else "NC",
+                            "causou_lesao": caused_injury,
+                            "houve_sangramento": bleeding,
+                            "direcionado_ponto_vital": targeted_vital_point,
+                            "funcao": selected_function,
+                        },
+                    )
+                    st.session_state["abc_reset_after_save"] = True
+                    if save_result.get("excel_warning"):
+                        st.session_state["abc_saved_warning"] = save_result["excel_warning"]
+                        st.session_state["abc_saved_message"] = "Registro ABC adicionado e gráficos atualizados."
+                    elif save_result.get("excel_status") == "queued":
+                        st.session_state["abc_saved_message"] = (
+                            "Registro ABC adicionado. Os gráficos foram atualizados e o Excel está sendo gerado em segundo plano."
+                        )
+                    else:
+                        st.session_state["abc_saved_message"] = "Registro ABC adicionado. Os gráficos e o Excel foram atualizados."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível adicionar o registro: {exc}")
+
+
+    with observation_tab:
+        with st.expander("Registrar tempo real de observação (opcional)"):
+            st.caption("Use apenas quando a folha informar início e fim da observação e todos os episódios desse período já estiverem transcritos. Um período sem episódios representa ausência observada somente com essa confirmação.")
+            window_date=st.date_input("Data da observação",value=None,format="DD/MM/YYYY",key=f"abc_window_date::{patient}")
+            window_start=st.text_input("Início da observação (HH:MM)",key=f"abc_window_start::{patient}")
+            window_end=st.text_input("Fim da observação (HH:MM)",key=f"abc_window_end::{patient}")
+            window_environment=st.text_input("Ambiente observado",key=f"abc_window_environment::{patient}")
+            window_observer=st.text_input("Observador responsável",key=f"abc_window_observer::{patient}")
+            window_source=st.text_input("Folha que documenta o período",key=f"abc_window_source::{patient}")
+            window_complete=st.checkbox("Confirmei a observação completa e transcrevi todos os episódios deste período",key=f"abc_window_complete::{patient}")
+            if st.button("Salvar período observado",key=f"abc_window_save::{patient}"):
+                try:
+                    if not window_date or not window_environment.strip() or not window_observer.strip() or not window_source.strip():
+                        raise ValueError("Informe data, ambiente, observador e referência da folha.")
+                    payload={"paciente":patient,"inicio":datetime.combine(window_date,parse_hour_minute_text(window_start)).isoformat(),
+                             "fim":datetime.combine(window_date,parse_hour_minute_text(window_end)).isoformat(),
+                             "ambiente":window_environment.strip(),"observador":window_observer.strip(),
+                             "fonte_referencia":window_source.strip(),"registro_completo":window_complete}
+                    response=requests.post(f"{API_URL}/api/abc/observacoes",json={**payload,"request_id":_abc_request_id(patient,payload,"observation")},timeout=API_TIMEOUT_SECONDS)
+                    if not response.ok: raise ValueError(_api_error_message(response))
+                    st.session_state.pop(f"abc_request::{patient}::observation",None)
+                    st.session_state["abc_saved_message"]="Período de observação registrado."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+        windows=analysis.get("janelas_observadas") or []
+        if windows:
+            with st.expander("Conferir períodos observados"):
+                render_html_table(pd.DataFrame(windows),["inicio","fim","ambiente","observador","fonte_referencia"],max_rows=500)
+                window_choices={f"{w['inicio']} — {w['fim']} | {w['ambiente']} | {w['intervalo_id'][-8:]}":w["intervalo_id"] for w in windows}
+                selected_window=st.selectbox("Período incorreto para remover",list(window_choices),index=None,key=f"abc_window_remove::{patient}")
+                confirmed_removal=st.checkbox("Confirmo a remoção deste período observado",key=f"abc_window_remove_confirm::{patient}")
+                if st.button("Remover período observado",disabled=not selected_window or not confirmed_removal,key=f"abc_window_remove_button::{patient}"):
+                    response=requests.delete(f"{API_URL}/api/abc/observacoes/{window_choices[selected_window]}",params={"paciente":patient},timeout=API_TIMEOUT_SECONDS)
+                    if response.ok: st.rerun()
+                    else: st.error(_api_error_message(response))
+
+
+    with history_tab:
+        management_records = list(
+            analysis_all.get("registros_para_gestao")
+            or analysis_all.get("registros_recentes")
+            or []
         )
-
-    render_abc_temporal_chains(patient, categories)
-
-    with st.expander("Quais fórmulas estamos usando"):
-        formula_blocks = [
-            (
-                "Comportamento após antecedente",
-                "P(B|A,E) = n(A,B,E) / n(A,E).",
-                "Proporção de exposições ao antecedente A, no ambiente E, seguidas pelo comportamento B.",
-            ),
-            (
-                "Consequência após a cadeia A-B",
-                "P(C|A,B,E) = n(A,B,C,E) / n(A,B,E).",
-                "Proporção de pares A-B seguidos pela consequência C no mesmo ambiente.",
-            ),
-            (
-                "Probabilidade da cadeia completa",
-                "P(A,B,C|E) = P(A|E) × P(B|A,E) × P(C|A,B,E).",
-                "Fatora a cadeia completa dentro do ambiente selecionado.",
-            ),
-            (
-                "Gravidade configurada e risco exploratório",
-                "D(C1)=0,20; D(C2)=1,00; R = P(A,B,C|E) × D.",
-                "Mantém frequência e peso configurado de gravidade separados e os combina apenas no índice exploratório interno.",
-            ),
-            (
-                "Lift da cadeia",
-                "Lift = P(A,B,C) / [P(A) × P(B) × P(C)].",
-                "Compara a cadeia observada com a frequência esperada se A, B e C fossem independentes.",
-            ),
-            (
-                "Suavização para pouca amostra",
-                "p_suavizada = (k + 1) / (n + 2).",
-                "Wilson acompanha somente a proporção bruta k/n; a opção bayesiana usa posterior Beta e intervalo de credibilidade próprios.",
-            ),
-            *prediction_formula_blocks,
-        ]
-        render_formula_blocks("Probabilidades, risco e previsão", formula_blocks)
-        st.caption(
-            "Cada clique marca as três categorias escolhidas e as demais como não ocorridas no intervalo. "
-            + str(analysis.get("aviso", "Associações descritivas não confirmam causa nem função comportamental."))
-        )
-
-    management_records = list(
-        analysis_all.get("registros_para_gestao")
-        or analysis_all.get("registros_recentes")
-        or []
-    )
-    recently_added_records = list(analysis_all.get("registros_recentes") or [])
-    if management_records:
-        def records_table(records: list[dict]) -> pd.DataFrame:
-            table = pd.DataFrame(records)
-            table["criterios_c2"] = table.apply(
-                lambda row: ", ".join(
-                    label
-                    for enabled, label in [
-                        (row.get("causou_lesao"), "lesão/ferimento"),
-                        (row.get("houve_sangramento"), "sangramento"),
-                        (row.get("direcionado_ponto_vital"), "ponto vital"),
-                    ]
-                    if enabled
+        recently_added_records = list(analysis_all.get("registros_recentes") or [])
+        if management_records:
+            def records_table(records: list[dict]) -> pd.DataFrame:
+                table = pd.DataFrame(records)
+                table["criterios_c2"] = table.apply(
+                    lambda row: ", ".join(
+                        label
+                        for enabled, label in [
+                            (row.get("causou_lesao"), "lesão/ferimento"),
+                            (row.get("houve_sangramento"), "sangramento"),
+                            (row.get("direcionado_ponto_vital"), "ponto vital"),
+                        ]
+                        if enabled
+                    )
+                    or "nenhum",
+                    axis=1,
                 )
-                or "nenhum",
-                axis=1,
-            )
-            created_values = table.get("criado_em", pd.Series(index=table.index, dtype=object))
-            table["adicionado_em"] = created_values.map(_abc_added_at_label)
-            return table.rename(
-                columns={
-                    "data": "Data",
-                    "hora": "Hora",
-                    "ambiente": "Ambiente",
-                    "antecedente": "Antecedente",
-                    "comportamento": "Comportamento",
-                    "consequencia": "Consequência",
-                    "classificacao_rotulo": "Classificação",
-                    "funcao": "Função",
-                    "criterios_c2": "Critérios C2",
-                    "adicionado_em": "Adicionado em",
-                }
-            )
+                created_values = table.get("criado_em", pd.Series(index=table.index, dtype=object))
+                table["adicionado_em"] = created_values.map(_abc_added_at_label)
+                return table.rename(
+                    columns={
+                        "data": "Data",
+                        "hora": "Hora",
+                        "ambiente": "Ambiente",
+                        "antecedente": "Antecedente",
+                        "comportamento": "Comportamento",
+                        "consequencia": "Consequência",
+                        "classificacao_rotulo": "Classificação",
+                        "funcao": "Função",
+                        "criterios_c2": "Critérios C2",
+                        "adicionado_em": "Adicionado em",
+                    }
+                )
 
-        st.markdown("#### Últimos registros adicionados")
-        st.caption("Ordenados pela data e hora em que foram incluídos no sistema, do mais novo para o mais antigo.")
-        render_html_table(
-            records_table(recently_added_records),
-            [
-                "Adicionado em",
-                "Data",
-                "Hora",
-                "Ambiente",
-                "Antecedente",
-                "Comportamento",
-                "Classificação",
-                "Função",
-                "Consequência",
-            ],
-            max_rows=12,
-        )
-
-        month_choices = _abc_month_choices(management_records)
-        with st.expander("Consultar histórico completo de acontecimentos"):
-            selected_history_month = st.selectbox(
-                "Mês dos acontecimentos",
-                list(month_choices),
-                key="abc_history_month",
-            )
-            history_records = _abc_records_in_month(
-                management_records,
-                month_choices[selected_history_month],
-            )
-            st.caption(f"{len(history_records)} acontecimento(s) no período selecionado.")
+            st.markdown("#### Últimos registros adicionados")
+            st.caption("Ordenados pela data e hora em que foram incluídos no sistema, do mais novo para o mais antigo.")
             render_html_table(
-                records_table(history_records),
+                records_table(recently_added_records),
                 [
+                    "Adicionado em",
                     "Data",
                     "Hora",
-                    "Adicionado em",
                     "Ambiente",
                     "Antecedente",
                     "Comportamento",
                     "Classificação",
                     "Função",
                     "Consequência",
-                    "Critérios C2",
                 ],
-                max_rows=500,
+                max_rows=12,
             )
 
-        removal_options = {
-            _abc_record_option_label(item): str(item.get("intervalo_id"))
-            for item in management_records
-        }
-        with st.expander("Editar um acontecimento registrado"):
-            edit_month_choices = _abc_month_choices(management_records)
-            selected_edit_month = st.selectbox(
-                "Mês do acontecimento para editar",
-                list(edit_month_choices),
-                key="abc_edit_month",
-            )
-            editable_records = _abc_records_in_month(
-                management_records,
-                edit_month_choices[selected_edit_month],
-            )
-            editing_options = {
-                _abc_record_option_label(item): item
-                for item in editable_records
+            month_choices = _abc_month_choices(management_records)
+            with st.expander("Consultar histórico completo de acontecimentos"):
+                selected_history_month = st.selectbox(
+                    "Mês dos acontecimentos",
+                    list(month_choices),
+                    key="abc_history_month",
+                )
+                history_records = _abc_records_in_month(
+                    management_records,
+                    month_choices[selected_history_month],
+                )
+                st.caption(f"{len(history_records)} acontecimento(s) no período selecionado.")
+                with st.container(height=420):
+                    render_html_table(
+                        records_table(history_records),
+                        [
+                            "Data",
+                            "Hora",
+                            "Adicionado em",
+                            "Ambiente",
+                            "Antecedente",
+                            "Comportamento",
+                            "Classificação",
+                            "Função",
+                            "Consequência",
+                            "Critérios C2",
+                        ],
+                        max_rows=500,
+                    )
+
+            removal_options = {
+                _abc_record_option_label(item): str(item.get("intervalo_id"))
+                for item in management_records
             }
-            selected_edit_label = st.selectbox(
-                "Acontecimento para editar",
-                list(editing_options),
-                key="abc_edit_selection",
-            )
-            edit_item = editing_options[selected_edit_label]
-            edit_id = str(edit_item.get("intervalo_id"))
-            edit_suffix = edit_id[-8:]
-            edit_timestamp = datetime.fromisoformat(str(edit_item["data_hora"]))
+            with st.expander("Editar um acontecimento registrado"):
+                edit_month_choices = _abc_month_choices(management_records)
+                selected_edit_month = st.selectbox(
+                    "Mês do acontecimento para editar",
+                    list(edit_month_choices),
+                    key="abc_edit_month",
+                )
+                editable_records = _abc_records_in_month(
+                    management_records,
+                    edit_month_choices[selected_edit_month],
+                )
+                editing_options = {
+                    _abc_record_option_label(item): item
+                    for item in editable_records
+                }
+                selected_edit_label = st.selectbox(
+                    "Acontecimento para editar",
+                    list(editing_options),
+                    key="abc_edit_selection",
+                )
+                edit_item = editing_options[selected_edit_label]
+                edit_id = str(edit_item.get("intervalo_id"))
+                edit_suffix = edit_id[-8:]
+                edit_timestamp = datetime.fromisoformat(str(edit_item["data_hora"]))
 
-            edit_a_col, edit_b_col, edit_c_col = st.columns(3)
-            edit_antecedent_options = antecedent_labels
-            edit_behavior_options = behavior_labels
-            edit_consequence_options = consequence_labels
-            with edit_a_col:
-                edit_antecedent = st.selectbox(
-                    "Antecedente",
-                    edit_antecedent_options,
-                    index=edit_antecedent_options.index(edit_item["antecedente"])
-                    if edit_item.get("antecedente") in edit_antecedent_options
-                    else 0,
-                    key=f"abc_edit_antecedent_{edit_suffix}",
-                )
-                edit_new_antecedent = ""
-                if edit_antecedent == NEW_ABC_OPTION:
-                    edit_new_antecedent = st.text_input(
-                        "Novo antecedente",
-                        max_chars=200,
-                        key=f"abc_edit_new_antecedent_{edit_suffix}",
+                edit_a_col, edit_b_col, edit_c_col = st.columns(3)
+                edit_antecedent_options = antecedent_labels
+                edit_behavior_options = behavior_labels
+                edit_consequence_options = consequence_labels
+                with edit_a_col:
+                    edit_antecedent = st.selectbox(
+                        "Antecedente",
+                        edit_antecedent_options,
+                        index=edit_antecedent_options.index(edit_item["antecedente"])
+                        if edit_item.get("antecedente") in edit_antecedent_options
+                        else 0,
+                        key=f"abc_edit_antecedent_{edit_suffix}",
                     )
-            with edit_b_col:
-                edit_behavior = st.selectbox(
-                    "Comportamento",
-                    edit_behavior_options,
-                    index=edit_behavior_options.index(edit_item["comportamento"])
-                    if edit_item.get("comportamento") in edit_behavior_options
-                    else 0,
-                    key=f"abc_edit_behavior_{edit_suffix}",
-                )
-                edit_new_behavior = ""
-                if edit_behavior == NEW_ABC_OPTION:
-                    edit_new_behavior = st.text_input(
-                        "Novo comportamento",
-                        max_chars=200,
-                        key=f"abc_edit_new_behavior_{edit_suffix}",
+                    edit_new_antecedent = ""
+                    if edit_antecedent == NEW_ABC_OPTION:
+                        edit_new_antecedent = st.text_input(
+                            "Novo antecedente",
+                            max_chars=200,
+                            key=f"abc_edit_new_antecedent_{edit_suffix}",
+                        )
+                with edit_b_col:
+                    edit_behavior = st.selectbox(
+                        "Comportamento",
+                        edit_behavior_options,
+                        index=edit_behavior_options.index(edit_item["comportamento"])
+                        if edit_item.get("comportamento") in edit_behavior_options
+                        else 0,
+                        key=f"abc_edit_behavior_{edit_suffix}",
                     )
-            with edit_c_col:
-                edit_consequence = st.selectbox(
-                    "Consequência",
-                    edit_consequence_options,
-                    index=edit_consequence_options.index(edit_item["consequencia"])
-                    if edit_item.get("consequencia") in edit_consequence_options
-                    else 0,
-                    key=f"abc_edit_consequence_{edit_suffix}",
-                )
-                edit_new_consequence = ""
-                if edit_consequence == NEW_ABC_OPTION:
-                    edit_new_consequence = st.text_input(
-                        "Nova consequência",
-                        max_chars=200,
-                        key=f"abc_edit_new_consequence_{edit_suffix}",
+                    edit_new_behavior = ""
+                    if edit_behavior == NEW_ABC_OPTION:
+                        edit_new_behavior = st.text_input(
+                            "Novo comportamento",
+                            max_chars=200,
+                            key=f"abc_edit_new_behavior_{edit_suffix}",
+                        )
+                with edit_c_col:
+                    edit_consequence = st.selectbox(
+                        "Consequência",
+                        edit_consequence_options,
+                        index=edit_consequence_options.index(edit_item["consequencia"])
+                        if edit_item.get("consequencia") in edit_consequence_options
+                        else 0,
+                        key=f"abc_edit_consequence_{edit_suffix}",
                     )
+                    edit_new_consequence = ""
+                    if edit_consequence == NEW_ABC_OPTION:
+                        edit_new_consequence = st.text_input(
+                            "Nova consequência",
+                            max_chars=200,
+                            key=f"abc_edit_new_consequence_{edit_suffix}",
+                        )
 
-            edit_d1, edit_d2, edit_d3, edit_d4 = st.columns([1, 1, 0.65, 1.2])
-            with edit_d1:
-                edit_date = st.date_input(
-                    "Data",
-                    value=edit_timestamp.date(),
-                    format="DD/MM/YYYY",
-                    key=f"abc_edit_date_{edit_suffix}",
-                )
-            with edit_d2:
-                edit_time_text = st.text_input(
-                    "Hora e minuto",
-                    value=edit_timestamp.strftime("%H:%M"),
-                    placeholder="Ex.: 9:30, 0930 ou 9h30",
-                    help="Ao digitar, o horário é interpretado automaticamente.",
-                    key=f"abc_edit_time_{edit_suffix}",
-                )
-            with edit_d3:
-                edit_second = st.number_input(
-                    "Segundo",
-                    min_value=0,
-                    max_value=59,
-                    value=edit_timestamp.second,
-                    step=1,
-                    key=f"abc_edit_second_{edit_suffix}",
-                )
-            with edit_d4:
-                edit_environment = st.text_input(
-                    "Ambiente",
-                    value=str(edit_item.get("ambiente") or ""),
-                    max_chars=160,
-                    key=f"abc_edit_environment_{edit_suffix}",
-                )
-
-            edit_s1, edit_s2 = st.columns([1, 1.4])
-            current_classification = str(edit_item.get("classificacao") or "C1")
-            with edit_s1:
-                edit_classification_label = st.radio(
-                    "Classificação",
-                    ["C1 - leve", "C2 - intenso"],
-                    index=1 if current_classification == "C2" else 0,
-                    horizontal=True,
-                    key=f"abc_edit_classification_{edit_suffix}",
-                )
-            current_function = str(edit_item.get("funcao") or "Indeterminada / em avaliação")
-            if current_function == "Não informada":
-                current_function = "Indeterminada / em avaliação"
-            edit_function_options = list(dict.fromkeys([*function_options[:-1], current_function, NEW_FUNCTION_OPTION]))
-            with edit_s2:
-                edit_function_option = st.selectbox(
-                    "Função informada (hipótese funcional)",
-                    edit_function_options,
-                    index=edit_function_options.index(current_function),
-                    key=f"abc_edit_function_{edit_suffix}",
-                )
-                edit_custom_function = ""
-                if edit_function_option == NEW_FUNCTION_OPTION:
-                    edit_custom_function = st.text_input(
-                        "Nova função ou hipótese",
-                        max_chars=120,
-                        key=f"abc_edit_new_function_{edit_suffix}",
+                edit_d1, edit_d2, edit_d3, edit_d4 = st.columns([1, 1, 0.65, 1.2])
+                with edit_d1:
+                    edit_date = st.date_input(
+                        "Data",
+                        value=edit_timestamp.date(),
+                        format="DD/MM/YYYY",
+                        key=f"abc_edit_date_{edit_suffix}",
+                    )
+                with edit_d2:
+                    edit_time_text = st.text_input(
+                        "Hora e minuto",
+                        value=edit_timestamp.strftime("%H:%M") if edit_item.get("precisao_horario")!="unknown" else "",
+                        placeholder="Ex.: 9:30, 0930 ou 9h30",
+                        help="Ao digitar, o horário é interpretado automaticamente.",
+                        key=f"abc_edit_time_{edit_suffix}",
+                    )
+                with edit_d3:
+                    edit_second = st.number_input(
+                        "Segundo",
+                        min_value=0,
+                        max_value=59,
+                        value=edit_timestamp.second,
+                        step=1,
+                        key=f"abc_edit_second_{edit_suffix}",
+                    )
+                with edit_d4:
+                    edit_environment = st.text_input(
+                        "Ambiente",
+                        value=str(edit_item.get("ambiente") or ""),
+                        max_chars=160,
+                        key=f"abc_edit_environment_{edit_suffix}",
                     )
 
-            edit_injury = False
-            edit_bleeding = False
-            edit_vital = False
-            if edit_classification_label.startswith("C2"):
-                ec1, ec2, ec3 = st.columns(3)
-                with ec1:
-                    edit_injury = st.checkbox(
-                        "Machucou ou feriu",
-                        value=bool(edit_item.get("causou_lesao")),
-                        key=f"abc_edit_injury_{edit_suffix}",
-                    )
-                with ec2:
-                    edit_bleeding = st.checkbox(
-                        "Houve sangramento",
-                        value=bool(edit_item.get("houve_sangramento")),
-                        key=f"abc_edit_bleeding_{edit_suffix}",
-                    )
-                with ec3:
-                    edit_vital = st.checkbox(
-                        "Direcionado a ponto vital",
-                        value=bool(edit_item.get("direcionado_ponto_vital")),
-                        key=f"abc_edit_vital_{edit_suffix}",
-                    )
+                edit_precision_options={"Precisão legada não confirmada":"legacy", "Minuto informado":"minute", "Segundo informado":"second", "Horário aproximado":"approximate", "Horário não informado":"unknown"}
+                edit_precision_values=list(edit_precision_options.values())
+                edit_precision_label=st.selectbox("Precisão do horário",list(edit_precision_options),index=edit_precision_values.index(edit_item.get("precisao_horario","legacy")),key=f"abc_edit_precision_{edit_suffix}")
+                edit_precision=edit_precision_options[edit_precision_label]
+                edit_frequency=st.number_input("Quantidade de respostas",min_value=1,max_value=100000,value=int(edit_item.get("frequencia") or 1),key=f"abc_edit_frequency_{edit_suffix}")
+                edit_source=st.text_input("Referência da folha / linha",value=str(edit_item.get("fonte_referencia") or ""),max_chars=200,key=f"abc_edit_source_{edit_suffix}")
+                edit_observer=st.text_input("Quem observou",value=str(edit_item.get("observador") or ""),max_chars=160,key=f"abc_edit_observer_{edit_suffix}")
+                edit_appointment=st.text_input("Identificação do atendimento",value=str(edit_item.get("atendimento_referencia") or ""),max_chars=160,key=f"abc_edit_appointment_{edit_suffix}")
+                edit_duration_known=st.checkbox("Duração medida disponível",value=edit_item.get("duracao_segundos") is not None,key=f"abc_edit_duration_known_{edit_suffix}")
+                edit_duration=st.number_input("Duração medida (segundos)",min_value=0.0,value=float(edit_item.get("duracao_segundos") or 0),key=f"abc_edit_duration_{edit_suffix}") if edit_duration_known else None
+                edit_confirm_duplicate=st.checkbox("Conferi: episódios semelhantes são acontecimentos distintos",key=f"abc_edit_duplicate_{edit_suffix}")
 
-            if st.button(
-                "Salvar alterações do acontecimento",
-                type="primary",
-                use_container_width=True,
-                key=f"abc_edit_save_{edit_suffix}",
-            ):
-                edit_selected_function = (
-                    edit_custom_function.strip()
-                    if edit_function_option == NEW_FUNCTION_OPTION
-                    else edit_function_option
-                )
-                if not edit_environment.strip():
-                    st.error("Informe o ambiente.")
-                elif not edit_selected_function:
-                    st.error("Informe a função ou hipótese funcional.")
-                elif edit_classification_label.startswith("C2") and not (
-                    edit_injury or edit_bleeding or edit_vital
+                edit_s1, edit_s2 = st.columns([1, 1.4])
+                current_classification = "NC" if edit_item.get("classificacao_assumida") else str(edit_item.get("classificacao") or "NC")
+                with edit_s1:
+                    edit_classification_label = st.radio(
+                        "Classificação",
+                        ["Não informado", "C1 - leve", "C2 - intenso"],
+                        index={"NC":0,"C1":1,"C2":2}.get(current_classification,0),
+                        horizontal=True,
+                        key=f"abc_edit_classification_{edit_suffix}",
+                    )
+                current_function = str(edit_item.get("funcao") or "Indeterminada / em avaliação")
+                if current_function == "Não informada":
+                    current_function = "Indeterminada / em avaliação"
+                edit_function_options = list(dict.fromkeys([*function_options[:-1], current_function, NEW_FUNCTION_OPTION]))
+                with edit_s2:
+                    edit_function_option = st.selectbox(
+                        "Função informada (hipótese funcional)",
+                        edit_function_options,
+                        index=edit_function_options.index(current_function),
+                        key=f"abc_edit_function_{edit_suffix}",
+                    )
+                    edit_custom_function = ""
+                    if edit_function_option == NEW_FUNCTION_OPTION:
+                        edit_custom_function = st.text_input(
+                            "Nova função ou hipótese",
+                            max_chars=120,
+                            key=f"abc_edit_new_function_{edit_suffix}",
+                        )
+
+                edit_injury = False
+                edit_bleeding = False
+                edit_vital = False
+                if edit_classification_label.startswith("C2"):
+                    ec1, ec2, ec3 = st.columns(3)
+                    with ec1:
+                        edit_injury = st.checkbox(
+                            "Machucou ou feriu",
+                            value=bool(edit_item.get("causou_lesao")),
+                            key=f"abc_edit_injury_{edit_suffix}",
+                        )
+                    with ec2:
+                        edit_bleeding = st.checkbox(
+                            "Houve sangramento",
+                            value=bool(edit_item.get("houve_sangramento")),
+                            key=f"abc_edit_bleeding_{edit_suffix}",
+                        )
+                    with ec3:
+                        edit_vital = st.checkbox(
+                            "Direcionado a ponto vital",
+                            value=bool(edit_item.get("direcionado_ponto_vital")),
+                            key=f"abc_edit_vital_{edit_suffix}",
+                        )
+
+                if st.button(
+                    "Salvar alterações do acontecimento",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"abc_edit_save_{edit_suffix}",
                 ):
-                    st.error("C2 exige ao menos um critério objetivo de intensidade.")
-                else:
-                    try:
-                        edit_antecedent_code = _resolve_abc_code(
-                            patient,
-                            edit_antecedent,
-                            edit_new_antecedent,
-                            "antecedente",
-                            antecedent_codes,
-                        )
-                        edit_behavior_code = _resolve_abc_code(
-                            patient,
-                            edit_behavior,
-                            edit_new_behavior,
-                            "comportamento",
-                            behavior_codes,
-                        )
-                        edit_consequence_code = _resolve_abc_code(
-                            patient,
-                            edit_consequence,
-                            edit_new_consequence,
-                            "consequencia",
-                            consequence_codes,
-                        )
-                        parsed_edit_time = parse_hour_minute_text(edit_time_text)
-                        update_result = update_abc_record(
-                            patient,
-                            edit_id,
-                            {
-                                "antecedente_codigo": edit_antecedent_code,
-                                "comportamento_codigo": edit_behavior_code,
-                                "consequencia_codigo": edit_consequence_code,
-                                "data": edit_date.isoformat(),
-                                "hora": parsed_edit_time.replace(second=int(edit_second)).strftime("%H:%M:%S"),
-                                "ambiente": edit_environment.strip(),
-                                "classificacao": edit_classification_label[:2],
-                                "causou_lesao": edit_injury,
-                                "houve_sangramento": edit_bleeding,
-                                "direcionado_ponto_vital": edit_vital,
-                                "funcao": edit_selected_function,
-                            },
-                        )
-                        if update_result.get("excel_warning"):
-                            st.session_state["abc_saved_warning"] = update_result["excel_warning"]
-                            st.session_state["abc_saved_message"] = (
-                                "Acontecimento editado. Gráficos, previsões e auditoria foram atualizados."
+                    edit_selected_function = (
+                        edit_custom_function.strip()
+                        if edit_function_option == NEW_FUNCTION_OPTION
+                        else edit_function_option
+                    )
+                    if not edit_environment.strip():
+                        st.error("Informe o ambiente.")
+                    elif not edit_selected_function:
+                        st.error("Informe a função ou hipótese funcional.")
+                    elif edit_classification_label.startswith("C2") and not (
+                        edit_injury or edit_bleeding or edit_vital
+                    ):
+                        st.error("C2 exige ao menos um critério objetivo de intensidade.")
+                    else:
+                        try:
+                            edit_antecedent_code = _resolve_abc_code(
+                                patient,
+                                edit_antecedent,
+                                edit_new_antecedent,
+                                "antecedente",
+                                antecedent_codes,
+                            ) if edit_antecedent != "Não informado" else None
+                            edit_behavior_code = _resolve_abc_code(
+                                patient,
+                                edit_behavior,
+                                edit_new_behavior,
+                                "comportamento",
+                                behavior_codes,
                             )
-                        elif update_result.get("excel_status") == "queued":
+                            edit_consequence_code = _resolve_abc_code(
+                                patient,
+                                edit_consequence,
+                                edit_new_consequence,
+                                "consequencia",
+                                consequence_codes,
+                            ) if edit_consequence != "Não informado" else None
+                            parsed_edit_time = parse_hour_minute_text(edit_time_text) if edit_precision!="unknown" else None
+                            update_result = update_abc_record(
+                                patient,
+                                edit_id,
+                                {
+                                    "antecedente_codigo": edit_antecedent_code,
+                                    "comportamento_codigo": edit_behavior_code,
+                                    "consequencia_codigo": edit_consequence_code,
+                                    "data": edit_date.isoformat(),
+                                    "hora": parsed_edit_time.replace(second=int(edit_second) if edit_precision in {"second","legacy"} else 0).strftime("%H:%M:%S") if parsed_edit_time else None,
+                                    "precisao_horario":edit_precision,"frequencia":int(edit_frequency),
+                                    "duracao_segundos":edit_duration,"fonte_referencia":edit_source,
+                                    "observador":edit_observer,"atendimento_referencia":edit_appointment,
+                                    "confirmar_duplicado":edit_confirm_duplicate,
+                                    "ambiente": edit_environment.strip(),
+                                    "classificacao": edit_classification_label[:2] if edit_classification_label.startswith(("C1","C2")) else "NC",
+                                    "causou_lesao": edit_injury,
+                                    "houve_sangramento": edit_bleeding,
+                                    "direcionado_ponto_vital": edit_vital,
+                                    "funcao": edit_selected_function,
+                                },
+                            )
+                            if update_result.get("excel_warning"):
+                                st.session_state["abc_saved_warning"] = update_result["excel_warning"]
+                                st.session_state["abc_saved_message"] = (
+                                    "Acontecimento editado. Gráficos, previsões e auditoria foram atualizados."
+                                )
+                            elif update_result.get("excel_status") == "queued":
+                                st.session_state["abc_saved_message"] = (
+                                    "Acontecimento editado. Gráficos e previsões foram atualizados; o Excel está sendo gerado em segundo plano."
+                                )
+                            else:
+                                st.session_state["abc_saved_message"] = (
+                                    "Acontecimento editado. Gráficos, previsões, auditoria e Excel foram atualizados."
+                                )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Não foi possível editar o acontecimento: {exc}")
+
+            with st.expander("Remover um acontecimento registrado"):
+                selected_removal = st.selectbox("Acontecimento", list(removal_options), key="abc_removal_selection")
+                st.caption("A remoção tira o acontecimento dos gráficos, mas permanece registrada no log de auditoria e no Excel.")
+                if st.button("Remover acontecimento", type="secondary", use_container_width=True):
+                    try:
+                        delete_result = delete_abc_record(patient, removal_options[selected_removal])
+                        if delete_result.get("excel_warning"):
+                            st.session_state["abc_saved_warning"] = delete_result["excel_warning"]
+                            st.session_state["abc_saved_message"] = "Acontecimento removido e gráficos atualizados."
+                        elif delete_result.get("excel_status") == "queued":
                             st.session_state["abc_saved_message"] = (
-                                "Acontecimento editado. Gráficos e previsões foram atualizados; o Excel está sendo gerado em segundo plano."
+                                "Acontecimento removido. Os gráficos foram atualizados e o Excel está sendo gerado em segundo plano."
                             )
                         else:
-                            st.session_state["abc_saved_message"] = (
-                                "Acontecimento editado. Gráficos, previsões, auditoria e Excel foram atualizados."
-                            )
+                            st.session_state["abc_saved_message"] = "Acontecimento removido. Os gráficos e o Excel foram atualizados."
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"Não foi possível editar o acontecimento: {exc}")
+                        st.error(f"Não foi possível remover o acontecimento: {exc}")
 
-        with st.expander("Remover um acontecimento registrado"):
-            selected_removal = st.selectbox("Acontecimento", list(removal_options), key="abc_removal_selection")
-            st.caption("A remoção tira o acontecimento dos gráficos, mas permanece registrada no log de auditoria e no Excel.")
-            if st.button("Remover acontecimento", type="secondary", use_container_width=True):
-                try:
-                    delete_result = delete_abc_record(patient, removal_options[selected_removal])
-                    if delete_result.get("excel_warning"):
-                        st.session_state["abc_saved_warning"] = delete_result["excel_warning"]
-                        st.session_state["abc_saved_message"] = "Acontecimento removido e gráficos atualizados."
-                    elif delete_result.get("excel_status") == "queued":
-                        st.session_state["abc_saved_message"] = (
-                            "Acontecimento removido. Os gráficos foram atualizados e o Excel está sendo gerado em segundo plano."
+
+    with reports_tab:
+        excel_col, path_col = st.columns([1, 2])
+        try:
+            excel_bytes, excel_name = load_abc_excel(patient)
+            with excel_col:
+                st.download_button(
+                    "Baixar Excel do paciente",
+                    data=excel_bytes,
+                    file_name=excel_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with path_col:
+                st.caption(f"Cópia automática no projeto: {analysis_all.get('excel_path', '-')}")
+                st.caption("Após incluir, editar ou remover, a cópia é atualizada em segundo plano.")
+                st.caption("Arquivo de saída: alterações feitas no Excel não são importadas pela aplicação.")
+        except Exception as exc:
+            st.warning(f"O Excel ainda não pôde ser disponibilizado: {exc}")
+
+
+    if total == 0:
+        for empty_tab in (hours_tab, evolution_tab, contexts_tab, chains_tab, reports_tab):
+            with empty_tab:
+                st.info("Não há episódios neste recorte. Ajuste os filtros ou adicione acontecimentos na aba Registros.")
+        return
+
+    with hours_tab:
+        render_abc_hour_overview(patient, analysis)
+        with st.expander("Tempo observado e taxa de episódios"):
+            exposure=analysis.get("exposicao") or {}
+            if exposure.get("status")=="calculable":
+                st.metric("Episódios por hora realmente observada",f"{exposure['occurrences_per_hour']:.2f}")
+                st.caption(f"{exposure['episodes_in_observed_time']} episódios dentro de {exposure['observed_hours']:.2f} horas observadas. As demais contagens incluem todos os episódios do recorte.")
+            else:
+                st.info(exposure.get("warning") or "Tempo real de observação não informado.")
+
+
+    with evolution_tab:
+        dates_tab, months_tab, weekdays_tab, timeline_tab = st.tabs(["Por data", "Por mês", "Dias da semana", "Linha do tempo"])
+    with dates_tab:
+        series = pd.DataFrame(analysis.get("serie_temporal", []))
+        if not series.empty:
+            series["data_exibicao"] = pd.to_datetime(series["data"], errors="coerce").dt.strftime("%d/%m/%Y")
+            date_order = series.drop_duplicates("data").sort_values("data")["data_exibicao"].tolist()
+            fig = go.Figure()
+            colors = ["#c17c74", "#7d9b76", "#6f86a4", "#b58a55", "#8a7a9d", "#6f9b96"]
+            for index, behavior_name in enumerate(series["comportamento"].drop_duplicates()):
+                item = series[series["comportamento"] == behavior_name]
+                fig.add_trace(
+                    go.Bar(
+                        x=item["data_exibicao"],
+                        y=item["quantidade"],
+                        name=behavior_name,
+                        marker_color=colors[index % len(colors)],
+                    )
+                )
+            fig.update_layout(
+                title="Frequência de comportamentos por data",
+                xaxis_title="Data",
+                yaxis_title="Quantidade de registros",
+                barmode="stack",
+            )
+            fig.update_xaxes(type="category", categoryorder="array", categoryarray=date_order)
+            st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+
+
+    with months_tab:
+        monthly=pd.DataFrame(temporal.get("por_mes") or [])
+        if not monthly.empty:
+            st.markdown("#### Comparação entre meses")
+            monthly["Horas observadas"] = monthly.get("horas_observadas", pd.Series(index=monthly.index,dtype=float)).map(lambda v:f"{v:.2f}" if pd.notna(v) else "Não informado")
+            monthly["Episódios/h observada"] = monthly.get("episodios_por_hora_observada", pd.Series(index=monthly.index,dtype=float)).map(lambda v:f"{v:.2f}" if pd.notna(v) else "Não calculável")
+            st.caption("Compare também os dias com registros: meses com mais dias transcritos podem acumular mais episódios.")
+            monthly_chart = go.Figure(go.Bar(x=monthly["mes"], y=monthly["quantidade"], text=monthly["quantidade"], textposition="outside", cliponaxis=False, marker_color="#397b83"))
+            monthly_chart.update_layout(height=340, xaxis_title="Mês", yaxis_title="Episódios registrados")
+            monthly_chart.update_yaxes(range=[0, max(1, monthly["quantidade"].max()) * 1.2])
+            st.plotly_chart(apply_chart_theme(monthly_chart), theme=None, width="stretch")
+            with st.expander("Ver números por mês"):
+                render_html_table(monthly.rename(columns={"mes":"Mês","quantidade":"Episódios","dias":"Dias com registros","respostas":"Respostas registradas"}),["Mês","Episódios","Dias com registros","Respostas registradas","Horas observadas","Episódios/h observada"],max_rows=500)
+
+    with weekdays_tab:
+        weekdays=pd.DataFrame(temporal.get("por_dia_semana") or [])
+        if not weekdays.empty:
+            st.markdown("#### Dias da semana")
+            st.caption("Totais dos registros disponíveis; consulte a quantidade de dias que sustenta cada total na tabela.")
+            weekday_chart = go.Figure(go.Bar(x=weekdays["nome"], y=weekdays["quantidade"], text=weekdays["quantidade"], textposition="outside", cliponaxis=False, marker_color="#397b83"))
+            weekday_chart.update_layout(height=340, xaxis_title="Dia da semana", yaxis_title="Episódios registrados")
+            weekday_chart.update_yaxes(range=[0, max(1, weekdays["quantidade"].max()) * 1.2])
+            st.plotly_chart(apply_chart_theme(weekday_chart), theme=None, width="stretch")
+            with st.expander("Ver números por dia da semana"):
+                render_html_table(weekdays.rename(columns={"nome":"Dia da semana","quantidade":"Episódios","dias":"Dias com registros"}),["Dia da semana","Episódios","Dias com registros"],max_rows=7)
+
+
+    with timeline_tab:
+        timeline = pd.DataFrame(analysis.get("linha_tempo", []))
+        if not timeline.empty:
+            timeline["data_hora"] = pd.to_datetime(timeline["data_hora"], errors="coerce")
+            fig = go.Figure()
+            timeline_colors = ["#c17c74", "#7d9b76", "#6f86a4", "#b58a55", "#8a7a9d", "#6f9b96"]
+            for index, environment_name in enumerate(timeline["ambiente"].drop_duplicates()):
+                item = timeline[timeline["ambiente"] == environment_name]
+                fig.add_trace(
+                    go.Scatter(
+                        x=item["data_hora"],
+                        y=item["cadeia"],
+                        mode="markers",
+                        name=environment_name,
+                        marker=dict(
+                            size=13,
+                            color=timeline_colors[index % len(timeline_colors)],
+                            symbol=item["classificacao"].map(
+                                {"C1 - leve": "circle", "C2 - intenso": "triangle-up", "Não classificado": "x"}
+                            ).fillna("x"),
+                            line=dict(width=1, color="#fffaf2"),
+                        ),
+                        customdata=item[["hora", "ambiente", "classificacao", "funcao"]],
+                        hovertemplate=(
+                            "%{y}<br>%{customdata[0]}<br>%{customdata[1]}<br>"
+                            "%{customdata[2]}<br>Função: %{customdata[3]}<extra></extra>"
+                        ),
+                    )
+                )
+            fig.update_layout(title="Linha do tempo dos episódios — precisão conforme a fonte", xaxis_title="Data e hora", yaxis_title="Cadeia A-B-C")
+            fig.update_xaxes(tickformat="%d/%m/%Y<br>%H:%M:%S")
+            st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+
+
+    with contexts_tab:
+        summary_tab, associations_tab, environments_tab, estimates_tab = st.tabs(["Resumo", "Associações", "Ambientes e gravidade", "Estimativas"])
+    with summary_tab:
+        latest = max(analysis.get("registros_para_gestao") or [{}], key=lambda r:str(r.get("data_hora") or ""))
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            render_metric_card("Registros ABC", str(total), "acontecimentos registrados")
+        with c2:
+            render_metric_card("Comportamentos", str(analysis.get("comportamentos_distintos", 0)), "categorias observadas")
+        with c3:
+            render_metric_card("Ambientes", str(analysis.get("ambientes_distintos", 0)), "contextos registrados")
+        with c4:
+            render_metric_card("Último registro", str(latest.get("data", "-")), str(latest.get("hora", "-")))
+
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            render_metric_card("C1 - leve", str(analysis.get("c1_leve", 0)), f"inclui {analysis.get('c1_por_regra',0)} atribuído(s) pela regra definida")
+        with s2:
+            render_metric_card("C2 - intenso", str(analysis.get("c2_intenso", 0)), "classificação de gravidade registrada")
+        with s3:
+            render_metric_card("Sem classificação", str(analysis.get("nao_classificados", 0)), "edite os registros históricos")
+        with s4:
+            render_metric_card("Funções", str(len(analysis.get("funcoes_observadas", []))), "hipóteses informadas")
+
+
+    with associations_tab:
+        antecedent_associations = pd.DataFrame(analysis.get("antecedente_comportamento", []))
+        consequence_associations = pd.DataFrame(analysis.get("comportamento_consequencia", []))
+        chart_left, chart_right = st.columns(2)
+        with chart_left:
+            if not antecedent_associations.empty:
+                view = antecedent_associations.head(10).copy()
+                view["associacao"] = view["antecedente"] + " -> " + view["comportamento"]
+                view["probabilidade"] = view["probabilidade_condicional"] * 100
+                fig = go.Figure(
+                    go.Bar(
+                        x=view["probabilidade"],
+                        y=view["associacao"],
+                        orientation="h",
+                        marker_color=PASTEL_SKILL,
+                        customdata=view[["suporte", "lift"]],
+                        hovertemplate="P(B|A)=%{x:.1f}%<br>n=%{customdata[0]}<br>lift=%{customdata[1]:.2f}<extra></extra>",
+                    )
+                )
+                fig.update_layout(title="P(comportamento | antecedente)", xaxis_title="Probabilidade condicional (%)", yaxis_title="")
+                fig.update_xaxes(range=[0, 100])
+                st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+        with chart_right:
+            if not consequence_associations.empty:
+                view = consequence_associations.head(10).copy()
+                view["associacao"] = view["comportamento"] + " -> " + view["consequencia"]
+                view["probabilidade"] = view["probabilidade_condicional"] * 100
+                fig = go.Figure(
+                    go.Bar(
+                        x=view["probabilidade"],
+                        y=view["associacao"],
+                        orientation="h",
+                        marker_color=PASTEL_BEHAVIOR,
+                        customdata=view[["suporte", "lift"]],
+                        hovertemplate="P(C|B)=%{x:.1f}%<br>n=%{customdata[0]}<br>lift=%{customdata[1]:.2f}<extra></extra>",
+                    )
+                )
+                fig.update_layout(title="P(consequencia | comportamento)", xaxis_title="Probabilidade condicional (%)", yaxis_title="")
+                fig.update_xaxes(range=[0, 100])
+                st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+
+
+    with environments_tab:
+        environments = pd.DataFrame(analysis.get("por_ambiente", []))
+        if not environments.empty:
+            fig = go.Figure(
+                go.Bar(
+                    x=environments["ambiente"],
+                    y=environments["quantidade"],
+                    marker_color=PASTEL_FORECAST,
+                )
+            )
+            fig.update_layout(title="Distribuição dos registros por ambiente", xaxis_title="Ambiente", yaxis_title="Registros")
+            st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+
+        severity_data = pd.DataFrame(analysis.get("por_classificacao", []))
+        function_data = pd.DataFrame(analysis.get("por_funcao", []))
+        severity_chart, function_chart = st.columns(2)
+        with severity_chart:
+            if not severity_data.empty:
+                severity_data["rotulo"] = severity_data["classificacao"].map(
+                    {"C1": "C1 - leve", "C2": "C2 - intenso", "NC": "Não classificado"}
+                ).fillna(severity_data["classificacao"])
+                severity_colors = severity_data["classificacao"].map(
+                    {"C1": "#7d9b76", "C2": "#c17c74", "NC": "#9b948b"}
+                ).fillna("#9b948b")
+                fig = go.Figure(
+                    go.Bar(
+                        x=severity_data["rotulo"],
+                        y=severity_data["quantidade"],
+                        marker_color=severity_colors,
+                    )
+                )
+                fig.update_layout(title="Classificação dos interferentes", xaxis_title="Nível", yaxis_title="Registros")
+                st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+        with function_chart:
+            if not function_data.empty:
+                fig = go.Figure(
+                    go.Bar(
+                        x=function_data["quantidade"],
+                        y=function_data["funcao"],
+                        orientation="h",
+                        marker_color="#6f86a4",
+                    )
+                )
+                fig.update_layout(title="Funções informadas", xaxis_title="Registros", yaxis_title="")
+                st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+
+        with st.expander("Mapa de frequência e gravidade por local"):
+            st.markdown("### Mapa de frequência e gravidade configurada por local")
+            st.caption(
+                "O eixo X mostra a frequência observada da cadeia; o eixo Y mostra o peso médio configurado de gravidade. "
+                "O tamanho do ponto representa suporte. C1/C2 são categorias registradas, não probabilidades clínicas."
+            )
+            map_environment = st.selectbox(
+                "Local do mapa de calor",
+                analysis.get("ambientes_observados", []),
+                key="abc_heatmap_environment",
+            )
+            risk_map = pd.DataFrame(analysis.get("mapa_risco", []))
+            if not risk_map.empty:
+                risk_map = risk_map[risk_map["ambiente"] == map_environment].copy()
+            if risk_map.empty:
+                st.info("Ainda não há cadeias suficientes no local selecionado para montar o mapa de risco.")
+            else:
+                risk_map["ocorrencia_pct"] = risk_map["probabilidade_ocorrencia"] * 100
+                severity_column = "peso_medio_gravidade" if "peso_medio_gravidade" in risk_map.columns else "indice_perigo"
+                risk_map["gravidade_configurada"] = risk_map[severity_column]
+                unknown_weights=risk_map[risk_map[severity_column].isna()]
+                if not unknown_weights.empty:
+                    st.caption("Cadeias sem classificação não recebem peso de gravidade.")
+                    render_html_table(unknown_weights,["cadeia","suporte","nao_classificado"],max_rows=100)
+                max_support = max(1, int(risk_map["suporte"].max()))
+                risk_map["tamanho"] = 14 + (risk_map["suporte"] / max_support) * 18
+                fig = go.Figure()
+                quadrant_specs = [
+                    (0, 50, 0, 0.5, "rgba(188, 216, 190, 0.30)", "Menor frequência / menor peso"),
+                    (0, 50, 0.5, 1.0, "rgba(236, 197, 178, 0.28)", "Menor frequência / maior peso"),
+                    (50, 100, 0, 0.5, "rgba(235, 220, 164, 0.30)", "Maior frequência / menor peso"),
+                    (50, 100, 0.5, 1.0, "rgba(207, 137, 130, 0.28)", "Maior frequência / maior peso"),
+                ]
+                for x0, x1, y0, y1, color, label in quadrant_specs:
+                    fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1, fillcolor=color, line_width=0, layer="below")
+                    fig.add_annotation(
+                        x=(x0 + x1) / 2,
+                        y=y1 - 0.05,
+                        text=label,
+                        showarrow=False,
+                        font=dict(size=11, color="#5d5145"),
+                        bgcolor="rgba(255,253,248,0.74)",
+                    )
+                symbol_specs = {
+                    "C1": ("circle", "#587957", "C1 - leve"),
+                    "C2": ("triangle-up", "#a94f49", "C2 - intenso"),
+                    "NC": ("x", "#6f6b66", "Não classificado"),
+                }
+                for classification_code, (symbol, color, label) in symbol_specs.items():
+                    item = risk_map[risk_map["classificacao_predominante"] == classification_code]
+                    if item.empty:
+                        continue
+                    fig.add_trace(
+                        go.Scatter(
+                            x=item["ocorrencia_pct"],
+                            y=item["gravidade_configurada"],
+                            mode="markers+text",
+                            name=label,
+                            text=item["comportamento"],
+                            textposition="top center",
+                            textfont=dict(size=10, color="#33291f"),
+                            marker=dict(
+                                symbol=symbol,
+                                size=item["tamanho"],
+                                color=color,
+                                line=dict(color="#fffdf8", width=2),
+                                opacity=0.92,
+                            ),
+                            customdata=item[["cadeia", "funcao", "suporte", "c1_leve", "c2_intenso", "nao_classificado"]],
+                            hovertemplate=(
+                                "%{customdata[0]}<br>Função: %{customdata[1]}<br>"
+                                "Frequência no local: %{x:.1f}%<br>Peso médio configurado: %{y:.2f}<br>"
+                                "n=%{customdata[2]} | C1=%{customdata[3]} | C2=%{customdata[4]} | sem classe=%{customdata[5]}"
+                                "<extra></extra>"
+                            ),
                         )
-                    else:
-                        st.session_state["abc_saved_message"] = "Acontecimento removido. Os gráficos e o Excel foram atualizados."
-                    st.rerun()
+                    )
+                fig.add_vline(x=50, line_width=1, line_dash="dash", line_color="#8f8171")
+                fig.add_hline(y=0.5, line_width=1, line_dash="dash", line_color="#8f8171")
+                fig.update_layout(
+                    title=f"Frequência observada × peso de gravidade em {map_environment}",
+                    xaxis_title="Frequência observada da cadeia no local (%)",
+                    yaxis_title="Peso médio configurado de gravidade",
+                    hovermode="closest",
+                    legend_title="Classificação predominante",
+                    height=620,
+                )
+                fig.update_xaxes(range=[-2, 102], dtick=10)
+                fig.update_yaxes(range=[-0.02, 1.02], dtick=0.1)
+                st.plotly_chart(apply_chart_theme(fig), theme=None, width="stretch")
+                if int(risk_map["nao_classificado"].sum()) > 0:
+                    st.info("Há registros oficiais sem C1/C2. Eles permanecem contabilizados separadamente e reduzem a qualidade da evidência.")
+
+
+
+    with chains_tab:
+        complete_chains_tab, temporal_chains_tab, formulas_tab = st.tabs(["A-B-C no episódio", "Entre episódios", "Como é calculado"])
+    with complete_chains_tab:
+        chains = pd.DataFrame(analysis.get("cadeias_completas", []))
+        selected_chain_row = None
+        selected_chain = None
+        if not chains.empty:
+            selected_chain = st.selectbox(
+                "Cadeia completa para análise detalhada",
+                chains["cadeia"].tolist(),
+                key="abc_selected_chain",
+            )
+            selected_chain_row = chains[chains["cadeia"] == selected_chain].iloc[0]
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                render_metric_card("P(A-B-C)", pct(float(selected_chain_row["probabilidade_conjunta"]) * 100), "frequência conjunta observada")
+            with c2:
+                render_metric_card("P(B | A)", pct(float(selected_chain_row["probabilidade_comportamento_dado_antecedente"]) * 100), "comportamento após antecedente")
+            with c3:
+                render_metric_card("P(C | A,B)", pct(float(selected_chain_row["probabilidade_consequencia_dada_cadeia_ab"]) * 100), "consequência após A-B")
+            with c4:
+                render_metric_card("Suporte", str(int(selected_chain_row["suporte"])), "cadeias completas observadas")
+
+            risk_c1, risk_c2, risk_c3 = st.columns(3)
+            with risk_c1:
+                render_metric_card("C1 - leve", str(int(selected_chain_row.get("c1_leve", 0))), "na cadeia selecionada")
+            with risk_c2:
+                render_metric_card("C2 - intenso", str(int(selected_chain_row.get("c2_intenso", 0))), "na cadeia selecionada")
+            with risk_c3:
+                render_metric_card(
+                    "Hipótese mais registrada",
+                    str(selected_chain_row.get("funcao_predominante", "Não informada")),
+                    f"peso médio configurado = {float(selected_chain_row.get('peso_medio_gravidade') or selected_chain_row.get('indice_perigo') or 0):.2f}",
+                )
+
+            chain_table = chains.rename(
+                columns={
+                    "cadeia": "Cadeia A-B-C",
+                    "suporte": "n",
+                    "probabilidade_conjunta": "P(A-B-C)",
+                    "probabilidade_comportamento_dado_antecedente": "P(B|A)",
+                    "probabilidade_consequencia_dada_cadeia_ab": "P(C|A,B)",
+                    "lift_conjunto": "Lift conjunto",
+                    "c1_leve": "C1",
+                    "c2_intenso": "C2",
+                    "indice_perigo": "Peso médio configurado",
+                    "funcao_predominante": "Função",
+                }
+            )
+            render_html_table(
+                chain_table,
+                ["Cadeia A-B-C", "Função", "C1", "C2", "Peso médio configurado", "n", "P(A-B-C)", "P(B|A)", "P(C|A,B)", "Lift conjunto"],
+                {
+                    "P(A-B-C)": lambda value: pct(float(value) * 100),
+                    "P(B|A)": lambda value: pct(float(value) * 100),
+                    "P(C|A,B)": lambda value: pct(float(value) * 100),
+                    "Peso médio configurado": lambda value: "-" if pd.isna(value) else f"{float(value):.2f}",
+                    "Lift conjunto": lambda value: "-" if pd.isna(value) else f"{float(value):.2f}",
+                },
+                max_rows=12,
+            )
+
+
+    with estimates_tab:
+        st.markdown("### Estimativa descritiva em registros semelhantes")
+        st.caption(
+            "Os registros legados são oficiais e entram no cálculo após normalização auditável. Como a base contém episódios, "
+            "mas não todas as oportunidades negativas observáveis, esta seção não estima o risco absoluto do próximo registro."
+        )
+        prediction_formula_blocks: list[tuple[str, str, str]] = []
+        prediction_behaviors = analysis_all.get("comportamentos_observados", [])
+        if prediction_behaviors:
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                prediction_behavior = st.selectbox("Comportamento a descrever", prediction_behaviors, key="abc_prediction_behavior")
+            with p2:
+                prediction_antecedent = st.selectbox(
+                    "Antecedente do recorte",
+                    ["Qualquer antecedente", *analysis_all.get("antecedentes_observados", [])],
+                    key="abc_prediction_antecedent",
+                )
+            with p3:
+                prediction_environment = st.selectbox(
+                    "Ambiente do recorte",
+                    ["Qualquer ambiente", *analysis_all.get("ambientes_observados", [])],
+                    key="abc_prediction_environment",
+                )
+            p4, p5 = st.columns(2)
+            with p4:
+                prediction_classification = st.selectbox(
+                    "Classificação para estratificação",
+                    ["Qualquer classificação", "C1", "C2"],
+                    key="abc_prediction_classification",
+                )
+            with p5:
+                prediction_function = st.selectbox(
+                    "Hipótese registrada para estratificação",
+                    ["Qualquer função", *analysis_all.get("funcoes_observadas", [])],
+                    key="abc_prediction_function",
+                )
+            try:
+                prediction = load_abc_prediction(
+                    patient,
+                    prediction_behavior,
+                    None if prediction_antecedent == "Qualquer antecedente" else prediction_antecedent,
+                    None if prediction_environment == "Qualquer ambiente" else prediction_environment,
+                    None if prediction_classification == "Qualquer classificação" else prediction_classification,
+                    None if prediction_function == "Qualquer função" else prediction_function,
+                )
+                c1, c2, c3, c4 = st.columns(4)
+                descriptive_value = prediction.get("estimativa_descritiva", prediction.get("probabilidade_prevista"))
+                with c1:
+                    render_metric_card("Frequência observada", pct(float(descriptive_value) * 100) if descriptive_value is not None else "-", prediction_behavior)
+                with c2:
+                    render_metric_card("k / n", f"{int(prediction.get('numerador') or 0)} / {int(prediction.get('denominador') or 0)}", "episódios registrados")
+                with c3:
+                    render_metric_card(
+                        "IC de Wilson",
+                        f"{pct(float(prediction['intervalo_wilson_inferior']) * 100)}–{pct(float(prediction['intervalo_wilson_superior']) * 100)}" if prediction.get("intervalo_wilson_inferior") is not None else "-",
+                        "proporção binomial bruta",
+                    )
+                with c4:
+                    render_metric_card("Qualidade", str(prediction.get("qualidade_evidencia", "inicial")), "regras auditáveis")
+
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    render_metric_card("Histórico observado", pct(float(prediction["probabilidade_baseline"]) * 100), f"n total = {prediction.get('amostra_total', 0)}")
+                with e2:
+                    context_value = prediction.get("probabilidade_contexto")
+                    render_metric_card("Contexto A + ambiente", pct(float(context_value) * 100) if context_value is not None else "-", f"n contexto = {prediction.get('amostra_contexto', 0)}")
+                with e3:
+                    render_metric_card("Modo analítico", "Descritivo", "risco absoluto indisponível")
+
+                prediction_formula_blocks = [
+                    (
+                        "Estimativa frequencista",
+                        "p = k / n; IC = intervalo de Wilson para a proporção binomial bruta.",
+                        "Numerador, denominador, método e nível do intervalo são exibidos e reproduzíveis.",
+                    ),
+                    (
+                        "Limite do estimando",
+                        "Estimando = distribuição relativa entre episódios ABC registrados.",
+                        "A ausência de registro não é convertida em ausência de comportamento nem em exemplo negativo.",
+                    ),
+                    (
+                        "Uso clínico",
+                        "Associação não demonstra causalidade nem confirma função comportamental.",
+                        "O resultado não substitui avaliação funcional ou julgamento clínico individualizado.",
+                    ),
+                ]
+            except Exception as exc:
+                st.warning(f"A estimativa descritiva ABC ainda não pôde ser calculada: {exc}")
+
+        with st.expander("Expandir análise funcional exploratória"):
+            st.markdown(
+                "Esta leitura organiza padrões de antecedente, comportamento, consequência, ambiente e tempo. Ela pode orientar hipóteses para avaliação funcional, mas não determina a função do comportamento."
+            )
+            if selected_chain_row is not None:
+                chain_environment = pd.DataFrame(analysis_all.get("cadeias_por_ambiente", []))
+                chain_environment = chain_environment[chain_environment["cadeia"] == selected_chain_row["cadeia"]]
+                if not chain_environment.empty:
+                    chain_environment = chain_environment.rename(
+                        columns={
+                            "ambiente": "Ambiente",
+                            "suporte": "n",
+                            "total_ambiente": "Registros no ambiente",
+                            "probabilidade_no_ambiente": "P(cadeia|ambiente)",
+                            "funcao_predominante": "Função",
+                            "c1_leve": "C1",
+                            "c2_intenso": "C2",
+                            "indice_perigo": "Peso médio configurado",
+                        }
+                    )
+                    render_html_table(
+                        chain_environment,
+                        ["Ambiente", "Função", "C1", "C2", "Peso médio configurado", "n", "Registros no ambiente", "P(cadeia|ambiente)"],
+                        {
+                            "P(cadeia|ambiente)": lambda value: pct(float(value) * 100),
+                            "Peso médio configurado": lambda value: "-" if pd.isna(value) else f"{float(value):.2f}",
+                        },
+                    )
+            st.markdown("#### Leitura assistida por IA")
+            st.caption(
+                "A IA recebe um resumo desidentificado dos registros e compara hipóteses concorrentes. "
+                "O nome do paciente não é enviado ao provedor externo."
+            )
+            ai_question = st.text_area(
+                "Pergunta ou foco para a IA (opcional)",
+                placeholder=(
+                    "Ex.: compare fuga/esquiva e atenção social e diga quais dados ainda faltam para diferenciá-las."
+                ),
+                height=90,
+                key="abc_functional_ai_question",
+            )
+            ai_environment = None if analysis_environment == "Todos os ambientes" else analysis_environment
+            ai_state_key = f"abc_functional_ai::{patient}::{selected_chain or ''}::{ai_environment or ''}::{json.dumps(scope, sort_keys=True)}::{analysis.get('dataset_hash','')}"
+            if st.button(
+                "Gerar leitura funcional com IA",
+                type="primary",
+                use_container_width=True,
+                key="abc_generate_functional_ai",
+            ):
+                try:
+                    with st.spinner("Comparando padrões, hipóteses e limites da amostra..."):
+                        st.session_state[ai_state_key] = load_abc_functional_ai(
+                            patient,
+                            chain=selected_chain,
+                            environment=ai_environment,
+                            question=ai_question,
+                        )
                 except Exception as exc:
-                    st.error(f"Não foi possível remover o acontecimento: {exc}")
+                    st.error(f"A leitura por IA não pôde ser gerada: {exc}")
+
+            ai_result = st.session_state.get(ai_state_key)
+            if ai_result:
+                mode = str(ai_result.get("modo") or "indisponível")
+                model = str(ai_result.get("modelo") or "")
+                if mode in {"limite_ia", "busca_local_fallback", "sem_provedor"}:
+                    st.warning(str(ai_result.get("resposta") or "A IA não respondeu neste momento."))
+                else:
+                    st.markdown(str(ai_result.get("resposta") or ""))
+                provider_label = f"Provedor: {mode}"
+                if model:
+                    provider_label += f" | Modelo: {model}"
+                st.caption(f"{provider_label} | Dados desidentificados: sim")
+                sources = list(ai_result.get("fontes") or [])
+                if sources and st.toggle("Mostrar fontes locais consultadas", key=f"abc_ai_sources_{ai_state_key}"):
+                    for index, source in enumerate(sources, start=1):
+                        st.markdown(
+                            f"**Fonte {index}:** {source.get('titulo') or 'Trecho sem título'}  \n"
+                            f"Arquivo: `{source.get('fonte', '-')}`"
+                        )
+            st.info(
+                "Para concluir uma avaliação funcional, combine estes padrões com definição operacional, medidas de oportunidade, observação direta, concordância entre observadores e, quando indicado, procedimentos funcionais conduzidos por profissional habilitado."
+            )
+
+
+    with temporal_chains_tab:
+        render_abc_temporal_chains(patient, categories)
+
+
+    with formulas_tab:
+        with st.expander("Quais fórmulas estamos usando"):
+            formula_blocks = [
+                (
+                    "Comportamento após antecedente",
+                    "P(B|A,E) = n(A,B,E) / n(A,E).",
+                    "Proporção de exposições ao antecedente A, no ambiente E, seguidas pelo comportamento B.",
+                ),
+                (
+                    "Consequência após a cadeia A-B",
+                    "P(C|A,B,E) = n(A,B,C,E) / n(A,B,E).",
+                    "Proporção de pares A-B seguidos pela consequência C no mesmo ambiente.",
+                ),
+                (
+                    "Probabilidade da cadeia completa",
+                    "P(A,B,C|E) = P(A|E) × P(B|A,E) × P(C|A,B,E).",
+                    "Fatora a cadeia completa dentro do ambiente selecionado.",
+                ),
+                (
+                    "Gravidade configurada e risco exploratório",
+                    "D(C1)=0,20; D(C2)=1,00; R = P(A,B,C|E) × D.",
+                    "Mantém frequência e peso configurado de gravidade separados e os combina apenas no índice exploratório interno.",
+                ),
+                (
+                    "Lift da cadeia",
+                    "Lift = P(A,B,C) / [P(A) × P(B) × P(C)].",
+                    "Compara a cadeia observada com a frequência esperada se A, B e C fossem independentes.",
+                ),
+                (
+                    "Suavização para pouca amostra",
+                    "p_suavizada = (k + 1) / (n + 2).",
+                    "Wilson acompanha somente a proporção bruta k/n; a opção bayesiana usa posterior Beta e intervalo de credibilidade próprios.",
+                ),
+                *prediction_formula_blocks,
+            ]
+            render_formula_blocks("Probabilidades, risco e previsão", formula_blocks)
+            st.caption(
+                "Cada lançamento registra um episódio. Categorias não selecionadas permanecem não informadas. "
+                + str(analysis.get("aviso", "Associações descritivas não confirmam causa nem função comportamental."))
+            )
+
+
+    with reports_tab:
+        report_chains = list(analysis.get("cadeias_completas") or [])
+        report_chain_names = [str(item.get("cadeia")) for item in report_chains if item.get("cadeia")]
+        report_chain_name = str(st.session_state.get("abc_selected_chain") or "")
+        if report_chain_name not in report_chain_names:
+            report_chain_name = report_chain_names[0] if report_chain_names else ""
+        report_chain = next(
+            (item for item in report_chains if str(item.get("cadeia")) == report_chain_name),
+            {},
+        )
+
+        report_behaviors = list(analysis_all.get("comportamentos_observados") or [])
+        report_behavior = str(st.session_state.get("abc_prediction_behavior") or "")
+        if report_behavior not in report_behaviors:
+            report_behavior = report_behaviors[0] if report_behaviors else ""
+        report_antecedent = str(st.session_state.get("abc_prediction_antecedent") or "Qualquer antecedente")
+        if report_antecedent not in ["Qualquer antecedente", *analysis_all.get("antecedentes_observados", [])]:
+            report_antecedent = "Qualquer antecedente"
+        report_prediction_environment = str(st.session_state.get("abc_prediction_environment") or "Qualquer ambiente")
+        if report_prediction_environment not in ["Qualquer ambiente", *analysis_all.get("ambientes_observados", [])]:
+            report_prediction_environment = "Qualquer ambiente"
+        report_classification = str(st.session_state.get("abc_prediction_classification") or "Qualquer classificação")
+        if report_classification not in {"Qualquer classificação", "C1", "C2"}:
+            report_classification = "Qualquer classificação"
+        report_function = str(st.session_state.get("abc_prediction_function") or "Qualquer função")
+        if report_function not in ["Qualquer função", *analysis_all.get("funcoes_observadas", [])]:
+            report_function = "Qualquer função"
+
+        report_prediction = {}
+        if report_behavior:
+            try:
+                report_prediction = load_abc_prediction(
+                    patient,
+                    report_behavior,
+                    None if report_antecedent == "Qualquer antecedente" else report_antecedent,
+                    None if report_prediction_environment == "Qualquer ambiente" else report_prediction_environment,
+                    None if report_classification == "Qualquer classificação" else report_classification,
+                    None if report_function == "Qualquer função" else report_function,
+                )
+            except Exception:
+                report_prediction = {}
+
+        report_environments = list(analysis_all.get("ambientes_observados") or [])
+        report_risk_environment = str(st.session_state.get("abc_heatmap_environment") or "")
+        if report_risk_environment not in report_environments:
+            if analysis_environment != "Todos os ambientes" and analysis_environment in report_environments:
+                report_risk_environment = analysis_environment
+            else:
+                report_risk_environment = report_environments[0] if report_environments else ""
+
+        report_ai_environment = None if analysis_environment == "Todos os ambientes" else analysis_environment
+        report_ai_key = f"abc_functional_ai::{patient}::{report_chain_name}::{report_ai_environment or ''}::{json.dumps(scope, sort_keys=True)}::{analysis.get('dataset_hash','')}"
+        report_ai_result = st.session_state.get(report_ai_key)
+
+        st.markdown("### Resumo ABC para impressão")
+        st.write(
+            "Gere o relatório descritivo completo para analistas do comportamento. O corpo apresenta a formulação clínica; "
+            "todas as cadeias e os indicadores técnicos permanecem nos apêndices."
+        )
+        with st.container(border=True):
+            report_start_date, report_end_date = analysis_start, analysis_end
+            st.caption(f"Período compartilhado com a análise: {analysis_start:%d/%m/%Y} a {analysis_end:%d/%m/%Y}.")
+
+            report_chain_scope_label = st.radio(
+                "Cadeias A-B-C do mesmo registro",
+                ["Uma cadeia específica", "Todas as cadeias comportamentais"],
+                index=1,
+                horizontal=True,
+                key="abc_report_chain_scope",
+            )
+            report_chain_scope = "selected" if report_chain_scope_label == "Uma cadeia específica" else "all"
+            if report_chain_scope == "selected" and report_chain_names:
+                report_chain_name = st.selectbox(
+                    "Cadeia para o relatório",
+                    report_chain_names,
+                    index=report_chain_names.index(report_chain_name) if report_chain_name in report_chain_names else 0,
+                    key="abc_report_selected_chain",
+                )
+            elif report_chain_names:
+                reference_chain = max(report_chains, key=lambda item: int(item.get("suporte") or 0))
+                report_chain_name = str(reference_chain.get("cadeia") or "")
+                st.caption(
+                    f"As {len(report_chain_names)} cadeias do recorte serão listadas. A mais frequente será apenas a referência visual."
+                )
+            else:
+                report_chain_name = ""
+                st.info("Ainda não há uma cadeia completa disponível neste recorte.")
+
+            chain_filter_col, identity_col = st.columns(2)
+            with chain_filter_col:
+                temporal_chain_filter = st.radio(
+                    "Cadeias temporais",
+                    ["Revisadas e candidatas", "Apenas revisadas e aceitas"],
+                    key="abc_print_temporal_chain_filter",
+                )
+            with identity_col:
+                report_generated_by = st.text_input(
+                    "Responsável pela geração",
+                    value="Usuário local",
+                    max_chars=160,
+                    key="abc_print_generated_by",
+                )
+
+            option_col1, option_col2, option_col3 = st.columns(3)
+            with option_col1:
+                report_include_charts = st.toggle("Incluir gráficos", value=True, key="abc_print_include_charts")
+                report_include_weekends = include_weekends
+            with option_col2:
+                report_include_explanation = st.toggle(
+                    "Incluir explicação do ABC fechado", value=True, key="abc_print_explanation"
+                )
+                report_include_limitations = st.toggle(
+                    "Incluir limitações clínicas", value=True, key="abc_print_limitations"
+                )
+            with option_col3:
+                report_anonymize = st.toggle(
+                    "Ocultar identificação do paciente", value=False, key="abc_print_anonymize"
+                )
+
+        report_chain = next(
+            (item for item in report_chains if str(item.get("cadeia")) == report_chain_name),
+            {},
+        )
+        report_ai_key = f"abc_functional_ai::{patient}::{report_chain_name}::{report_ai_environment or ''}::{json.dumps(scope, sort_keys=True)}::{analysis.get('dataset_hash','')}"
+        report_ai_result = st.session_state.get(report_ai_key)
+        report_reviewed_only = temporal_chain_filter == "Apenas revisadas e aceitas"
+        report_include_candidates = not report_reviewed_only
+        report_environment_param = None if analysis_environment == "Todos os ambientes" else analysis_environment
+        report_state_key = "abc_prediction_report_" + str(
+            hash(
+                (
+                    patient,
+                    json.dumps(scope, sort_keys=True),
+                    analysis.get("dataset_hash"),
+                    report_start_date,
+                    report_end_date,
+                    analysis_environment,
+                    report_chain_scope,
+                    report_chain_name,
+                    report_reviewed_only,
+                    report_include_charts,
+                    report_include_weekends,
+                    report_include_explanation,
+                    report_include_limitations,
+                    report_anonymize,
+                    report_generated_by,
+                    total,
+                )
+            )
+        )
+        preview_state_key = f"{report_state_key}_preview"
+        preview_col, print_col = st.columns(2)
+        with preview_col:
+            preview_clicked = st.button(
+                "Visualizar resumo",
+                use_container_width=True,
+                key="abc_preview_printable_summary",
+            )
+        with print_col:
+            print_clicked = st.button(
+                "Imprimir resumo ABC",
+                type="primary",
+                use_container_width=True,
+                key="abc_prepare_prediction_report",
+            )
+
+        if preview_clicked or print_clicked:
+            try:
+                with st.spinner("Preparando o resumo clínico ABC..."):
+                    report_summary = load_abc_report_summary(
+                        patient,
+                        start_date=report_start_date,
+                        end_date=report_end_date,
+                        environment=report_environment_param,
+                        include_weekends=report_include_weekends,
+                        include_candidate_chains=report_include_candidates,
+                        reviewed_chains_only=report_reviewed_only,
+                        include_charts=report_include_charts,
+                        anonymize_patient=report_anonymize,
+                        generated_by=report_generated_by or "Usuário local",
+                        output_format="pdf" if print_clicked else "preview",
+                    )
+                    st.session_state[preview_state_key] = report_summary
+                    if print_clicked:
+                        try:
+                            report_temporal_data = load_abc_temporal_chains(patient)
+                        except Exception:
+                            report_temporal_data = {"candidates": [], "stats": [], "matrix": [], "timeline": []}
+                        filtered_analysis = report_summary.get("analysis") or analysis
+                        filtered_chains = list(filtered_analysis.get("cadeias_completas") or [])
+                        filtered_chain = next(
+                            (item for item in filtered_chains if str(item.get("cadeia")) == report_chain_name),
+                            max(filtered_chains, key=lambda item: int(item.get("suporte") or 0)) if filtered_chains else {},
+                        )
+                        filtered_observation = report_summary.get("observation_summary") or {}
+                        filtered_behavior = (report_summary.get("most_frequent") or {}).get("behavior") or {}
+                        filtered_total = int(filtered_analysis.get("total_registros") or filtered_observation.get("total_records") or 0)
+                        filtered_behavior_count = int(filtered_behavior.get("quantidade") or 0)
+                        report_prediction_for_period = {
+                            **report_prediction,
+                            "analysis_mode": "descriptive",
+                            "comportamento": filtered_behavior.get("nome") or report_prediction.get("comportamento") or "-",
+                            "numerador": filtered_behavior_count,
+                            "denominador": filtered_total,
+                            "estimativa_descritiva": (filtered_behavior_count / filtered_total) if filtered_total else None,
+                            "metodo": "proporção descritiva do recorte filtrado",
+                            "intervalo_agrupado_sessao": report_summary.get("top_behavior_session_cluster_interval") or {},
+                        }
+                        report_payload = {
+                            "patient": report_summary.get("patient", {}).get("display_name") or patient,
+                            "environment": analysis_environment,
+                            "risk_environment": report_risk_environment,
+                            "analysis": filtered_analysis,
+                            "analysis_all": filtered_analysis,
+                            "chain_scope": report_chain_scope,
+                            "selected_chain": filtered_chain,
+                            "prediction": report_prediction_for_period,
+                            "temporal_data": report_temporal_data,
+                            "report_summary": report_summary,
+                            "include_charts": report_include_charts,
+                            "include_abc_explanation": report_include_explanation,
+                            "include_limitations": report_include_limitations,
+                            "ai_result": report_ai_result,
+                        }
+                        report_docx_bytes = build_abc_report_docx(report_payload)
+                        st.session_state[report_state_key] = {
+                            "docx": report_docx_bytes,
+                            "pdf": build_abc_report_pdf_from_docx(report_docx_bytes),
+                        }
+            except Exception as exc:
+                st.error(f"Não foi possível preparar o resumo ABC: {exc}")
+
+        report_preview = st.session_state.get(preview_state_key)
+        if report_preview:
+            st.markdown("#### Pré-visualização do resumo")
+            st.write(report_preview.get("descriptive_summary") or "Sem resumo disponível.")
+            preview_observation = report_preview.get("observation_summary") or {}
+            preview_quality = report_preview.get("data_quality") or {}
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Sessões", int(preview_observation.get("sessions") or 0))
+            p2.metric("Intervalos observados", int(preview_observation.get("observed_intervals") or 0))
+            p3.metric("Cobertura", f"{float(preview_observation.get('coverage') or 0) * 100:.1f}%" if preview_observation.get("observed_intervals") else "Não avaliável")
+            p4.metric("Qualidade", str(preview_quality.get("status") or "insuficiente").capitalize())
+            for warning in preview_quality.get("warnings") or []:
+                st.warning(warning)
+            st.caption(report_preview.get("clinical_disclaimer") or "")
+
+        generated_abc_report = st.session_state.get(report_state_key)
+        if generated_abc_report:
+            st.success("Resumo ABC pronto para salvar ou imprimir.")
+            report_filename_patient = "Paciente_anonimizado" if report_anonymize else patient
+            report_word_col, report_pdf_col = st.columns(2)
+            with report_word_col:
+                st.download_button(
+                    "Baixar Word ABC",
+                    data=generated_abc_report["docx"],
+                    file_name=abc_report_filename(report_filename_patient, "docx"),
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+            with report_pdf_col:
+                st.download_button(
+                    "Salvar como PDF",
+                    data=generated_abc_report["pdf"],
+                    file_name=abc_report_filename(report_filename_patient, "pdf"),
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+        st.caption(
+            "Use “Imprimir resumo ABC” para gerar o Word e o PDF completos. A prévia é apenas uma síntese na tela. "
+            "Gere novamente após alterar período ou opções."
+        )
+
+
 
 
 def render_behavior_prediction(patient: str, df_behavior: pd.DataFrame, period: tuple[date, date]) -> None:
@@ -2823,7 +3070,7 @@ def render_behavior_prediction(patient: str, df_behavior: pd.DataFrame, period: 
     )
 
 
-st.set_page_config(page_title="Sellas Predição Analítica", layout="wide")
+st.set_page_config(page_title="Sellas — Registros e análise ABC", layout="wide")
 inject_css()
 
 st.markdown(
@@ -2831,10 +3078,10 @@ st.markdown(
     <section class="sellas-page-header prediction-header">
         <div>
             <span class="sellas-eyebrow">Sellas Project</span>
-            <h1>Predição analítica comportamental</h1>
-            <p>Modelos probabilísticos para habilidades, objetivos e comportamentos-problema.</p>
+            <h1>Registros e análise comportamental</h1>
+            <p>Acontecimentos ABC, horários e evolução dos registros do Sellas.</p>
         </div>
-        <span class="sellas-header-badge">Foco matemático</span>
+        <span class="sellas-header-badge">Análise dos registros</span>
     </section>
     """,
     unsafe_allow_html=True,
@@ -2854,14 +3101,20 @@ except Exception as exc:
     st.stop()
 
 if not lista_pacientes:
-    st.warning("Banco de dados vazio.")
-    if st.button("Sincronizar bHave agora"):
-        sincronizar_bhave_api()
-        st.cache_data.clear()
-        st.rerun()
+    st.warning("Ainda não há pacientes cadastrados no Sellas.")
     st.stop()
 
 paciente_sel = st.sidebar.selectbox("Paciente", lista_pacientes)
+active_tab = st.radio(
+    "Área de análise",
+    ["Previsão de habilidades/objetivos", "Previsão comportamental", "Análise ABC (fechado)"],
+    index=2, horizontal=True, label_visibility="collapsed", key="prediction_area",
+)
+if active_tab == "Análise ABC (fechado)":
+    st.markdown(f'<div class="patient-strip"><span>Paciente</span><strong>{html.escape(paciente_sel)}</strong><small>Registros ABC do Sellas</small></div>', unsafe_allow_html=True)
+    render_abc_registration_and_analysis(paciente_sel)
+    st.stop()
+
 st.sidebar.markdown("---")
 if st.sidebar.button("Sincronizar bHave"):
     with st.spinner("Buscando dados no bHave..."):
@@ -2885,14 +3138,6 @@ period = st.sidebar.date_input(
 )
 if not isinstance(period, tuple) or len(period) != 2:
     period = (default_start, default_end)
-
-active_tab = st.radio(
-    "Área de previsão",
-    ["Previsão de habilidades/objetivos", "Previsão comportamental", "Análise ABC (fechado)"],
-    horizontal=True,
-    label_visibility="collapsed",
-    key="prediction_area",
-)
 
 st.markdown(
     f"""

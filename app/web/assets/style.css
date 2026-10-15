@@ -1,4 +1,4 @@
-/* Sellas Project dashboard theme */
+﻿/* Sellas Project dashboard theme */
 
 :root {
     --sellas-bg: #fbf7ef;
@@ -266,6 +266,26 @@ label,
     border-radius: 8px;
     box-shadow: var(--sellas-shadow);
     padding: 1.25rem;
+}
+
+/* Compact selectors and subviews in the ABC workspace. */
+.stRadio [role="radiogroup"][aria-label="Ordem das faixas"] {
+    flex-wrap: nowrap;
+    gap: 0.4rem;
+    margin: 0;
+    padding-bottom: 0.25rem;
+    border-bottom: 0;
+}
+
+.stRadio [role="radiogroup"][aria-label="Ordem das faixas"] > label {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.stTabs .stTabs [data-baseweb="tab-panel"] {
+    border: 0;
+    box-shadow: none;
+    padding: 0.75rem 0;
 }
 
 .stButton > button,

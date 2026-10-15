@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 from typing import Any, Literal, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ load_dotenv()
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import create_engine, text
 from app.data.models import SessionLocal
 from app.security import require_env, sanitize_text
@@ -22,8 +23,10 @@ from app.services.knowledge_agent import (
     search as search_knowledge,
     status as knowledge_status,
 )
+from app.services.abc_integrity import DuplicateRecordError, answer_time_question, attach_exposure_to_time_summary, build_time_summary, filter_records, temporal_candidates_in_scope
 from app.services.abc_closed import (
     add_closed_record,
+    add_observation_window,
     build_abc_analysis,
     build_abc_printable_summary,
     combine_local_datetime,
@@ -132,20 +135,53 @@ class ClinicalAgentPayload(BaseModel):
 
 class ABCClosedRecordPayload(BaseModel):
     paciente: str = Field(..., min_length=1, max_length=128)
-    antecedente_codigo: str = Field(..., min_length=1, max_length=80)
+    antecedente_codigo: Optional[str] = Field(None, min_length=1, max_length=80)
     comportamento_codigo: str = Field(..., min_length=1, max_length=80)
-    consequencia_codigo: str = Field(..., min_length=1, max_length=80)
-    data: dt.date = Field(default_factory=dt.date.today)
-    hora: dt.time
+    consequencia_codigo: Optional[str] = Field(None, min_length=1, max_length=80)
+    data: dt.date = Field(default_factory=lambda: dt.datetime.now(ZoneInfo("America/Sao_Paulo")).date())
+    hora: Optional[dt.time] = None
     ambiente: str = Field(..., min_length=1, max_length=160)
-    classificacao: Literal["C1", "C2"]
+    classificacao: Literal["C1", "C2", "NC"] = "NC"
     causou_lesao: bool = False
     houve_sangramento: bool = False
     direcionado_ponto_vital: bool = False
-    funcao: str = Field(..., min_length=1, max_length=120)
+    funcao: str = Field("Indeterminada / em avaliação", min_length=1, max_length=120)
+    precisao_horario: Literal["second", "minute", "approximate", "unknown", "legacy"] = "minute"
+    frequencia: int = Field(1, ge=1, le=100000)
+    duracao_segundos: Optional[float] = Field(None, ge=0, allow_inf_nan=False)
+    fonte_referencia: Optional[str] = Field(None, max_length=200)
+    observador: Optional[str] = Field(None, max_length=160)
+    atendimento_referencia: Optional[str] = Field(None, max_length=160)
+    request_id: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F-]{36}$")
+    confirmar_duplicado: bool = False
+
+    @model_validator(mode="after")
+    def validate_time(self):
+        if self.precisao_horario == "unknown":
+            if self.hora is not None:
+                raise ValueError("Horário desconhecido deve ser enviado sem hora.")
+        elif self.hora is None:
+            raise ValueError("Informe a hora ou escolha horário desconhecido.")
+        return self
+
+
+class ABCObservationPayload(BaseModel):
+    paciente: str = Field(..., min_length=1, max_length=128)
+    inicio: dt.datetime
+    fim: dt.datetime
+    ambiente: str = Field(..., min_length=1, max_length=160)
+    observador: str = Field(..., min_length=1, max_length=160)
+    fonte_referencia: str = Field(..., min_length=1, max_length=200)
+    registro_completo: bool = False
+    request_id: str = Field(..., pattern=r"^[0-9a-fA-F-]{36}$")
 
 
 class ABCFunctionalAnalysisPayload(BaseModel):
+    data_inicio: Optional[dt.date] = None
+    data_fim: Optional[dt.date] = None
+    comportamento: Optional[str] = None
+    classificacao: Optional[Literal["C1", "C2", "NC"]] = None
+    incluir_finais_semana: bool = True
     paciente: str = Field(..., min_length=1, max_length=128)
     cadeia: Optional[str] = Field(None, max_length=700)
     ambiente: Optional[str] = Field(None, max_length=160)
@@ -405,10 +441,46 @@ def adicionar_categoria_abc(payload: ABCCustomCategoryPayload) -> dict[str, Any]
         return item
     except HTTPException:
         raise
+    except DuplicateRecordError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao criar categoria ABC: {sanitize_text(exc, max_length=400)}") from exc
+
+
+@app.post("/api/abc/observacoes")
+def adicionar_janela_observada(payload: ABCObservationPayload):
+    try:
+        with engine.connect() as conn:
+            patient_id = _patient_id(conn, payload.paciente)
+        return add_observation_window(engine, patient_token=patient_token_uuid(patient_id),
+            start=payload.inicio, end=payload.fim, environment=payload.ambiente.strip(),
+            observer=payload.observador.strip(), source_reference=payload.fonte_referencia.strip(),
+            complete_recording=payload.registro_completo, request_id=payload.request_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/abc/observacoes/{interval_id}")
+def remover_janela_observada(interval_id: str, paciente: str = Query(...)):
+    import uuid
+    try:
+        uuid.UUID(interval_id)
+        with engine.begin() as conn:
+            patient_id = _patient_id(conn, paciente)
+            row = conn.execute(text("""SELECT i.id,i.sessao_id FROM abc_intervals i JOIN abc_sessions s ON s.id=i.sessao_id
+                WHERE i.id=CAST(:i AS UUID) AND s.patient_token=CAST(:p AS UUID)
+                  AND i.metadados->>'record_kind'='observation' FOR UPDATE OF i"""),
+                {"i":interval_id,"p":patient_token_uuid(patient_id)}).mappings().first()
+            if not row:
+                raise HTTPException(status_code=404,detail="Janela observada não encontrada.")
+            conn.execute(text("INSERT INTO abc_action_logs(patient_token,acao,intervalo_id,snapshot) VALUES(CAST(:p AS UUID),'registro_removido',CAST(:i AS UUID),CAST(:snapshot AS JSONB))"),
+                {"p":patient_token_uuid(patient_id),"i":interval_id,"snapshot":json.dumps({"observation_window":True})})
+            conn.execute(text("DELETE FROM abc_intervals WHERE id=CAST(:i AS UUID)"),{"i":interval_id})
+        return {"ok":True}
+    except ValueError as exc:
+        raise HTTPException(status_code=400,detail="Identificador inválido.") from exc
 
 
 @app.post("/api/abc/registros")
@@ -416,14 +488,14 @@ def adicionar_registro_abc(payload: ABCClosedRecordPayload, background_tasks: Ba
     try:
         with engine.connect() as conn:
             patient_id = _patient_id(conn, payload.paciente)
-        data_hora = combine_local_datetime(payload.data, payload.hora)
+        data_hora = combine_local_datetime(payload.data, payload.hora or dt.time())
         token = patient_token_uuid(patient_id)
         result = add_closed_record(
             engine,
             patient_token=token,
-            antecedente_codigo=_clean_query_param(payload.antecedente_codigo, max_length=80),
+            antecedente_codigo=_clean_query_param(payload.antecedente_codigo, max_length=80) if payload.antecedente_codigo else None,
             comportamento_codigo=_clean_query_param(payload.comportamento_codigo, max_length=80),
-            consequencia_codigo=_clean_query_param(payload.consequencia_codigo, max_length=80),
+            consequencia_codigo=_clean_query_param(payload.consequencia_codigo, max_length=80) if payload.consequencia_codigo else None,
             data_hora=data_hora,
             ambiente=_clean_query_param(payload.ambiente, max_length=160),
             classificacao=payload.classificacao,
@@ -431,6 +503,8 @@ def adicionar_registro_abc(payload: ABCClosedRecordPayload, background_tasks: Ba
             houve_sangramento=payload.houve_sangramento,
             direcionado_ponto_vital=payload.direcionado_ponto_vital,
             funcao=_clean_query_param(payload.funcao, max_length=120),
+            **payload.model_dump(include={"precisao_horario", "frequencia", "duracao_segundos",
+                "fonte_referencia", "observador", "atendimento_referencia", "request_id", "confirmar_duplicado"}),
         )
         return {
             **result,
@@ -442,6 +516,8 @@ def adicionar_registro_abc(payload: ABCClosedRecordPayload, background_tasks: Ba
         }
     except HTTPException:
         raise
+    except DuplicateRecordError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -462,16 +538,18 @@ def editar_registro_abc(
             engine,
             patient_token=token,
             interval_id=interval_id,
-            antecedente_codigo=_clean_query_param(payload.antecedente_codigo, max_length=80),
+            antecedente_codigo=_clean_query_param(payload.antecedente_codigo, max_length=80) if payload.antecedente_codigo else None,
             comportamento_codigo=_clean_query_param(payload.comportamento_codigo, max_length=80),
-            consequencia_codigo=_clean_query_param(payload.consequencia_codigo, max_length=80),
-            data_hora=combine_local_datetime(payload.data, payload.hora),
+            consequencia_codigo=_clean_query_param(payload.consequencia_codigo, max_length=80) if payload.consequencia_codigo else None,
+            data_hora=combine_local_datetime(payload.data, payload.hora or dt.time()),
             ambiente=_clean_query_param(payload.ambiente, max_length=160),
             classificacao=payload.classificacao,
             causou_lesao=payload.causou_lesao,
             houve_sangramento=payload.houve_sangramento,
             direcionado_ponto_vital=payload.direcionado_ponto_vital,
             funcao=_clean_query_param(payload.funcao, max_length=120),
+            **payload.model_dump(include={"precisao_horario", "frequencia", "duracao_segundos",
+                "fonte_referencia", "observador", "atendimento_referencia", "request_id", "confirmar_duplicado"}),
         )
         return {
             **result,
@@ -483,6 +561,8 @@ def editar_registro_abc(
         }
     except HTTPException:
         raise
+    except DuplicateRecordError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -516,19 +596,41 @@ def remover_registro_abc(
         raise HTTPException(status_code=500, detail=f"Erro ao remover registro ABC: {sanitize_text(exc, max_length=400)}") from exc
 
 
+def _scoped_abc_records(patient_id, *, data_inicio=None, data_fim=None, ambiente=None,
+                        comportamento=None, classificacao=None, incluir_finais_semana=True):
+    from app.services.abc_methodology import normalize_abc_records
+    return filter_records(normalize_abc_records(load_abc_patient_records(engine, patient_token_uuid(patient_id))),
+        start_date=data_inicio, end_date=data_fim, environment=ambiente, behavior=comportamento,
+        classification=classificacao, include_weekends=incluir_finais_semana)
+
+
 @app.get("/api/abc/analise")
 def obter_analise_abc(
     paciente: str = Query(..., min_length=1, max_length=128),
     ambiente: Optional[str] = Query(None, min_length=1, max_length=160),
+    data_inicio: Optional[dt.date] = Query(None),
+    data_fim: Optional[dt.date] = Query(None),
+    comportamento: Optional[str] = Query(None, max_length=200),
+    classificacao: Optional[Literal["C1", "C2", "NC"]] = Query(None),
+    incluir_finais_semana: bool = Query(True),
+    faixa_minutos: int = Query(60, ge=15, le=60),
 ) -> dict[str, Any]:
     try:
         with engine.connect() as conn:
             patient_id = _patient_id(conn, paciente)
-        records = load_abc_patient_records(engine, patient_token_uuid(patient_id))
-        if ambiente:
-            ambiente_limpo = _clean_query_param(ambiente, max_length=160)
-            records = [record for record in records if record.get("ambiente") == ambiente_limpo]
+        records = _scoped_abc_records(patient_id, data_inicio=data_inicio, data_fim=data_fim,
+            ambiente=ambiente, comportamento=comportamento, classificacao=classificacao,
+            incluir_finais_semana=incluir_finais_semana)
         analysis = build_abc_analysis(records)
+        analysis["distribuicao_temporal"] = build_time_summary(records, faixa_minutos)
+        intervals = load_observation_metadata(engine, patient_token=patient_token_uuid(patient_id),
+            start_date=data_inicio, end_date=data_fim, environment=ambiente, include_weekends=incluir_finais_semana)
+        from app.services.abc_methodology import compute_exposure_summary
+        from app.services.abc_methodology import analysis_run_hash
+        analysis["dataset_hash"] = analysis_run_hash(records, {"intervals":sorted(intervals,key=lambda r:str(r.get("intervalo_id") or ""))})
+        analysis["exposicao"] = compute_exposure_summary(records, intervals)
+        analysis["distribuicao_temporal"] = attach_exposure_to_time_summary(analysis["distribuicao_temporal"], analysis["exposicao"])
+        analysis["janelas_observadas"] = [item for item in intervals if item.get("record_kind") == "observation"]
         return {
             **analysis,
             "filtro_ambiente": ambiente,
@@ -536,6 +638,8 @@ def obter_analise_abc(
         }
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao analisar registros ABC: {sanitize_text(exc, max_length=240)}") from exc
 
@@ -546,6 +650,8 @@ def obter_resumo_imprimivel_abc(
     data_inicio: Optional[dt.date] = Query(None),
     data_fim: Optional[dt.date] = Query(None),
     ambiente: Optional[str] = Query(None, min_length=1, max_length=160),
+    comportamento: Optional[str] = Query(None, max_length=200),
+    classificacao: Optional[Literal["C1", "C2", "NC"]] = Query(None),
     incluir_finais_semana: bool = Query(True),
     incluir_cadeias_candidatas: bool = Query(True),
     apenas_cadeias_revisadas: bool = Query(False),
@@ -573,7 +679,7 @@ def obter_resumo_imprimivel_abc(
         interval_ids = {str(item.get("intervalo_id")) for item in intervals}
         records = [
             item
-            for item in load_abc_patient_records(engine, token)
+            for item in _scoped_abc_records(patient_id, data_inicio=data_inicio, data_fim=data_fim, ambiente=clean_environment, comportamento=comportamento, classificacao=classificacao, incluir_finais_semana=incluir_finais_semana)
             if str(item.get("intervalo_id")) in interval_ids
         ]
         interval_session = {
@@ -582,7 +688,8 @@ def obter_resumo_imprimivel_abc(
             if item.get("intervalo_id") and item.get("session_id")
         }
         candidates = []
-        for item in list_chain_candidates(engine, patient_token=token):
+        for item in temporal_candidates_in_scope(list_chain_candidates(engine, patient_token=token),
+            {str(r["intervalo_id"]) for r in records}):
             candidates.append(
                 {
                     **item,
@@ -606,6 +713,7 @@ def obter_resumo_imprimivel_abc(
                 "period_start": data_inicio.isoformat() if data_inicio else None,
                 "period_end": data_fim.isoformat() if data_fim else None,
                 "environment": clean_environment or "Todos os ambientes",
+                "behavior": comportamento, "classification": classificacao,
                 "include_weekends": incluir_finais_semana,
                 "include_charts": incluir_graficos,
                 "include_candidate_chains": incluir_cadeias_candidatas,
@@ -644,11 +752,17 @@ def analisar_funcao_abc_com_ia(payload: ABCFunctionalAnalysisPayload) -> dict[st
     try:
         with engine.connect() as conn:
             patient_id = _patient_id(conn, payload.paciente)
-        records = load_abc_patient_records(engine, patient_token_uuid(patient_id))
+        records = _scoped_abc_records(patient_id, data_inicio=payload.data_inicio, data_fim=payload.data_fim,
+            ambiente=payload.ambiente if payload.ambiente != "Todos os ambientes" else None,
+            comportamento=payload.comportamento, classificacao=payload.classificacao,
+            incluir_finais_semana=payload.incluir_finais_semana)
         if not records:
             raise HTTPException(status_code=404, detail="Paciente sem registros ABC para análise.")
 
         analysis = build_abc_analysis(records)
+        calculated = answer_time_question(payload.pergunta or "", analysis)
+        if calculated:
+            return calculated
         chain = _clean_query_param(payload.cadeia, max_length=700) if payload.cadeia else None
         environment = _clean_query_param(payload.ambiente, max_length=160) if payload.ambiente else None
         if chain and chain not in {item.get("cadeia") for item in analysis.get("cadeias_completas", [])}:
@@ -665,6 +779,8 @@ def analisar_funcao_abc_com_ia(payload: ABCFunctionalAnalysisPayload) -> dict[st
         )
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -692,6 +808,8 @@ def detectar_cadeias_abc(payload: ABCChainDetectPayload) -> dict[str, Any]:
         )
     except HTTPException:
         raise
+    except DuplicateRecordError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -711,10 +829,40 @@ def aprovar_cadeias_abc_atuais(payload: ABCApproveCurrentChainsPayload) -> dict[
         )
     except HTTPException:
         raise
+    except DuplicateRecordError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao aprovar cadeias atuais: {sanitize_text(exc, max_length=400)}") from exc
+
+
+@app.get("/api/abc/chains/scoped")
+def obter_cadeias_no_recorte(paciente: str = Query(...), data_inicio: Optional[dt.date] = Query(None),
+    data_fim: Optional[dt.date] = Query(None), ambiente: Optional[str] = Query(None),
+    comportamento: Optional[str] = Query(None), classificacao: Optional[str] = Query(None),
+    incluir_finais_semana: bool = Query(True)):
+    from app.services.abc_chains import load_chain_episodes, calculate_chain_statistics
+    if data_inicio and data_fim and data_inicio > data_fim:
+        raise HTTPException(status_code=400,detail="A data inicial não pode ser posterior à data final.")
+    with engine.connect() as conn:
+        patient_id = _patient_id(conn,paciente)
+    token = patient_token_uuid(patient_id)
+    records = _scoped_abc_records(patient_id,data_inicio=data_inicio,data_fim=data_fim,ambiente=ambiente,
+        comportamento=comportamento,classificacao=classificacao,incluir_finais_semana=incluir_finais_semana)
+    ids = {str(row["intervalo_id"]) for row in records}
+    episodes = [row for row in load_chain_episodes(engine,token) if str(row["interval_id"]) in ids]
+    candidates = temporal_candidates_in_scope(list_chain_candidates(engine,patient_token=token),ids)
+    config = get_active_chain_config(engine)["config"]
+    stats = calculate_chain_statistics(episodes,candidates,config)
+    from collections import Counter
+    valid = [r for r in candidates if r["validation_status"] in {"candidate","accepted"}]
+    totals = Counter(r["from_consequence_code"] for r in valid)
+    cells = Counter((r["from_consequence_code"],r["to_antecedent_code"]) for r in valid)
+    matrix = [{"from_consequence_code":a,"to_antecedent_code":b,"count":n,"probability":n/totals[a]} for (a,b),n in cells.items()]
+    return {"candidates":candidates,"stats":stats,"matrix":matrix,
+            "timeline":[{**r,"start_ts":r["start_ts"].isoformat(),"end_ts":r["end_ts"].isoformat()} for r in episodes],
+            "aviso":"Cadeias entre fim de C e início de A exigem esses instantes medidos. Horários isolados de episódios não fornecem essa medida."}
 
 
 @app.get("/api/abc/chains/candidates")
@@ -829,6 +977,8 @@ def adicionar_regra_cadeia_abc(payload: ABCTransitionRulePayload) -> dict[str, A
             rationale=_clean_query_param(payload.rationale, max_length=2000) if payload.rationale else None,
             active=payload.active,
         )
+    except DuplicateRecordError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -867,11 +1017,14 @@ def prever_comportamento_abc(
     ambiente: Optional[str] = Query(None, min_length=1, max_length=160),
     classificacao: Optional[Literal["C1", "C2"]] = Query(None),
     funcao: Optional[str] = Query(None, min_length=1, max_length=120),
+    data_inicio: Optional[dt.date] = Query(None),
+    data_fim: Optional[dt.date] = Query(None),
+    incluir_finais_semana: bool = Query(True),
 ) -> dict[str, Any]:
     try:
         with engine.connect() as conn:
             patient_id = _patient_id(conn, paciente)
-        records = load_abc_patient_records(engine, patient_token_uuid(patient_id))
+        records = _scoped_abc_records(patient_id, data_inicio=data_inicio, data_fim=data_fim, incluir_finais_semana=incluir_finais_semana)
         return predict_abc_behavior(
             records,
             behavior=_clean_query_param(comportamento, max_length=200),
@@ -882,6 +1035,8 @@ def prever_comportamento_abc(
         )
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao calcular estimativa descritiva ABC: {sanitize_text(exc, max_length=300)}") from exc
 
@@ -1071,11 +1226,19 @@ def buscar_conhecimento(
 def consultar_agente_clinico(payload: ClinicalAgentPayload):
     data_inicio = payload.data_inicio.isoformat() if payload.data_inicio else None
     data_fim = payload.data_fim.isoformat() if payload.data_fim else None
+    with engine.connect() as conn:
+        abc_patient_id = _patient_id(conn, payload.paciente)
+    abc_records = _scoped_abc_records(abc_patient_id, data_inicio=payload.data_inicio, data_fim=payload.data_fim)
+    abc_analysis = build_abc_analysis(abc_records)
+    calculated = answer_time_question(payload.pergunta, abc_analysis)
+    if calculated:
+        return calculated
     contexto_paciente = obter_dados_paciente(
         paciente=payload.paciente,
         data_inicio=data_inicio,
         data_fim=data_fim,
     )
+    contexto_paciente["abc_sellas"] = abc_analysis
     return answer_with_knowledge(
         question=payload.pergunta,
         patient_context=contexto_paciente,

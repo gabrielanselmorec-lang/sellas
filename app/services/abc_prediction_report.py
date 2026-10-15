@@ -304,6 +304,12 @@ def build_abc_report_docx(payload: dict[str, Any]) -> bytes:
         "interpretadas junto da duração, das atividades e das oportunidades observadas em cada contexto."
     )
     _add_docx_table(doc, ["Ambiente", "Horas", "Episódios", "Episódios/h"], _exposure_rows(summary), [3.2, 1.0, 1.1, 1.2])
+    doc.add_heading("Horários dos acontecimentos", level=2)
+    doc.add_paragraph("Distribuição dos episódios registrados; horários ausentes não são posicionados à meia-noite. Horários aproximados e legados não confirmam precisão de segundos.")
+    _add_docx_table(doc,["Faixa", "Episódios", "% total", "Dias"],_time_rows(summary,payload),[2.0,1.5,1.5,1.5])
+    doc.add_heading("Comparação mensal",level=2)
+    _add_docx_table(doc,["Mês", "Episódios", "Dias com registros", "Horas observadas", "Episódios/h"],_month_rows(summary,payload),[1.0,1.0,1.5,1.5,1.5])
+
 
     doc.add_page_break()
     doc.add_heading("4. Padrões ABC clinicamente prioritários", level=1)
@@ -575,6 +581,12 @@ def _build_abc_report_pdf_legacy(payload: dict[str, Any]) -> bytes:
             ),
         ]
     )
+    story.extend([
+        Paragraph("Horários dos acontecimentos",styles["SellasH1"]),
+        _pdf_table(["Faixa","Episódios","% total","Dias"],_time_rows(summary,payload),[5*cm,4*cm,4*cm,4*cm],styles),
+        Paragraph("Comparação mensal",styles["SellasH1"]),
+        _pdf_table(["Mês","Episódios","Dias","Horas","Episódios/h"],_month_rows(summary,payload),[3*cm,3*cm,3*cm,4*cm,4*cm],styles),
+    ])
     warnings = quality.get("warnings") or []
     if warnings:
         story.append(Paragraph("Alertas de qualidade", styles["SellasH1"]))
@@ -806,6 +818,12 @@ def build_abc_report_pdf(payload: dict[str, Any]) -> bytes:
             "junto da duração, das atividades e das oportunidades observadas em cada contexto.", styles["SellasBody"]),
         _pdf_table(["Ambiente", "Horas", "Episódios", "Episódios/h"], _exposure_rows(summary),
                    [7.4 * cm, 2.6 * cm, 2.8 * cm, 3.0 * cm], styles),
+    ])
+    story.extend([
+        Paragraph("Horários dos acontecimentos",styles["SellasH2"]),
+        _pdf_table(["Faixa","Episódios","% total","Dias"],_time_rows(summary,payload),[5*cm,4*cm,4*cm,4*cm],styles),
+        Paragraph("Comparação mensal",styles["SellasH2"]),
+        _pdf_table(["Mês","Episódios","Dias","Horas","Episódios/h"],_month_rows(summary,payload),[3*cm,3*cm,3*cm,4*cm,4*cm],styles),
     ])
     if include_charts and distribution_chart is not None:
         story.extend([
@@ -1168,15 +1186,16 @@ def _normalized_report_summary(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "patient": {"display_name": payload.get("patient") or "-", "anonymized": False},
         "observation_summary": {
-            "sessions": total,
-            "total_intervals": total,
-            "observed_intervals": total,
+            "sessions": int(analysis.get("sessoes_unicas") or 0),
+            "total_records": total,
+            "total_intervals": 0,
+            "observed_intervals": 0,
             "not_observed_intervals": 0,
             "invalid_intervals": 0,
-            "coverage": 1.0 if total else 0.0,
-            "observed_hours": total * 5 / 60,
-            "occurrence_intervals": total,
-            "occurrence_percentage": 1.0 if total else 0.0,
+            "coverage": None,
+            "observed_hours": None,
+            "occurrence_intervals": 0,
+            "occurrence_percentage": None,
             "missing_percentage": 0.0,
         },
         "most_frequent": {
@@ -1191,7 +1210,7 @@ def _normalized_report_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "antecedent_behavior_associations": analysis.get("antecedente_comportamento") or [],
         "behavior_consequence_associations": analysis.get("comportamento_consequencia") or [],
         "behavior_chains": [],
-        "data_quality": {"status": "inicial" if total else "insuficiente", "coverage": 1.0 if total else 0.0, "warnings": []},
+        "data_quality": {"status": "inicial" if total else "insuficiente", "coverage": None, "warnings": ["Tempo real de observação não informado; taxas por hora indisponíveis."]},
         "descriptive_summary": build_abc_plain_language_explanation(payload)["headline"],
         "clinical_disclaimer": DEFAULT_CLINICAL_DISCLAIMER,
     }
@@ -1207,9 +1226,9 @@ def _clinical_summary_rows(summary: dict[str, Any], payload: dict[str, Any]) -> 
         ["Sessões", _display_value(observation.get("sessions"))],
         ["Registros ABC completos", _display_value(observation.get("total_records"))],
         ["Ocorrências de comportamento", _display_value(observation.get("behavior_occurrences"))],
-        ["Horas observadas", f"{_finite(observation.get('observed_hours')):.2f} h"],
+        ["Horas observadas", f"{_finite(observation.get('observed_hours')):.2f} h" if observation.get("observed_hours") else "Não informado"],
         ["Intervalos totais / observados", f"{int(observation.get('total_intervals') or 0)} / {int(observation.get('observed_intervals') or 0)}"],
-        ["Cobertura observacional", _pct(_finite(observation.get("coverage")))],
+        ["Cobertura observacional", _pct(_finite(observation.get("coverage"))) if observation.get("observed_intervals") else "Não avaliável"],
         ["Intervalos com ocorrência", f"{int(observation.get('occurrence_intervals') or 0)} ({_pct(_finite(observation.get('occurrence_percentage')))})"],
         ["Antecedente mais frequente", str((frequent.get("antecedent") or {}).get("nome") or "Não disponível")],
         ["Comportamento mais frequente", str((frequent.get("behavior") or {}).get("nome") or "Não disponível")],
@@ -1227,7 +1246,7 @@ def _clinical_identification_rows(payload: dict[str, Any]) -> list[list[str]]:
         ["Período analisado", _summary_period_label(summary, payload)],
         ["Ambientes incluídos", str(payload.get("environment") or "Todos os ambientes registrados")],
         ["Fonte", "Registros diretos no instrumento ABC fechado"],
-        ["Volume da amostra", f"{int(observation.get('total_records') or (payload.get('analysis') or {}).get('total_registros') or 0)} registros; {_decimal_pt(observation.get('observed_hours'), 1)} h observadas"],
+        ["Volume da amostra", f"{int(observation.get('total_records') or (payload.get('analysis') or {}).get('total_registros') or 0)} registros; " + (f"{_decimal_pt(observation.get('observed_hours'), 1)} h observadas" if observation.get("observed_hours") else "tempo observado não informado")],
         ["Dados biopsicossociais", "Não informados nesta fonte; integrar antes de decisões clínicas"],
     ]
 
@@ -1312,10 +1331,11 @@ def _quality_rows(summary: dict[str, Any]) -> list[list[str]]:
     return [
         ["Classificação geral", str(quality.get("status_scope") or quality.get("status") or "insuficiente").capitalize()],
         ["Prontidão preditiva", str(quality.get("predictive_readiness") or "Não avaliada")],
-        ["Cobertura", _pct(_finite(quality.get("coverage")))],
-        ["Horas observadas", _decimal_pt(observation.get("observed_hours"), 1)],
+        ["C1 atribuídos pela regra do responsável", str(int(quality.get("c1_por_regra") or 0))],
+        ["Cobertura", _pct(_finite(quality.get("coverage"))) if observation.get("observed_intervals") else "Não avaliável"],
+        ["Horas observadas", _decimal_pt(observation.get("observed_hours"), 1) if observation.get("observed_hours") else "Não informado"],
         ["Episódios por hora observada", _decimal_pt(observation.get("occurrences_per_observed_hour"), 1)],
-        ["Oportunidades observadas sem episódio", str(int(observation.get("opportunities_without_occurrence") or 0))],
+        ["Oportunidades observadas sem episódio", str(int(observation["opportunities_without_occurrence"])) if observation.get("observed_hours") and observation.get("opportunities_without_occurrence") is not None else "Não avaliável"],
         ["Intervalos não observados", str(int(observation.get("not_observed_intervals") or 0))],
         ["Intervalos inválidos", str(int(observation.get("invalid_intervals") or 0))],
         ["Percentual ausente", _pct(_finite(observation.get("missing_percentage")))],
@@ -1340,11 +1360,24 @@ def _exposure_rows(summary: dict[str, Any]) -> list[list[str]]:
             [
                 str(environment),
                 _decimal_pt(values.get("observed_hours"), 1),
-                str(int(values.get("occurrence_intervals") or 0)),
+                str(int(values.get("episodes",values.get("occurrence_intervals")) or 0)),
                 _decimal_pt(values.get("occurrences_per_hour"), 1),
             ]
         )
     return rows or [["Exposição não disponível", "-", "-", "-"]]
+
+
+def _time_rows(summary, payload):
+    temporal=(summary.get("analysis") or payload.get("analysis") or {}).get("distribuicao_temporal") or {}
+    rows=temporal.get("por_horario") or []
+    return [[f"{r['inicio']}–{r['fim']}",str(r["quantidade"]),_pct(r["percentual_total"]),str(r["dias"])]
+            for r in rows] or [["Sem horário disponível","-","-","-"]]
+
+
+def _month_rows(summary, payload):
+    temporal=(summary.get("analysis") or payload.get("analysis") or {}).get("distribuicao_temporal") or {}
+    return [[r["mes"],str(r["quantidade"]),str(r["dias"]),_decimal_pt(r.get("horas_observadas"),1),
+             _decimal_pt(r.get("episodios_por_hora_observada"),1)] for r in temporal.get("por_mes",[])] or [["Sem dados","-","-","-","-"]]
 
 
 def _association_table_rows(summary: dict[str, Any], key: str, left_key: str, right_key: str) -> list[list[str]]:

@@ -140,33 +140,40 @@ summary.getRange("C:G").format.columnWidth = 13;
 const activeHeaders = [[
   "ID do intervalo", "Data", "Hora", "Ambiente", "Antecedente", "Comportamento",
   "Classificação", "Função informada", "Machucou ou feriu", "Sangramento",
-  "Ponto vital", "Índice de perigo", "Consequência",
+  "Ponto vital", "Peso configurado de gravidade", "Consequência",
+  "Precisão do horário", "Respostas no episódio", "Duração medida (s)", "Referência da folha", "Observador", "Atendimento",
 ]];
-active.getRange("A1:M1").values = activeHeaders;
-styleHeader(active.getRange("A1:M1"));
+active.getRange("A1:S1").values = activeHeaders;
+styleHeader(active.getRange("A1:S1"));
 const activeRows = (payload.activeRecords ?? []).map((record) => {
   return [
     record.intervalo_id ?? "",
     excelLocalDate(record.data_hora),
-    localTimeText(record.data_hora),
+    record.precisao_horario === "unknown" ? "Não informado" : (record.precisao_horario === "approximate" ? "≈ " : "") + localTimeText(record.data_hora).slice(0, record.precisao_horario === "second" ? 8 : 5),
     record.ambiente ?? "",
     record.antecedente ?? "",
     record.comportamento ?? "",
     record.classificacao_rotulo ?? "Não classificado",
     record.funcao ?? "Não informada",
-    record.causou_lesao ? "Sim" : "Não",
-    record.houve_sangramento ? "Sim" : "Não",
-    record.direcionado_ponto_vital ? "Sim" : "Não",
+    (record.classificacao === "NC" || record.classificacao_assumida) ? "Não informado" : record.causou_lesao ? "Sim" : "Não",
+    (record.classificacao === "NC" || record.classificacao_assumida) ? "Não informado" : record.houve_sangramento ? "Sim" : "Não",
+    (record.classificacao === "NC" || record.classificacao_assumida) ? "Não informado" : record.direcionado_ponto_vital ? "Sim" : "Não",
     record.indice_perigo ?? null,
     record.consequencia ?? "",
+    record.precisao_horario ?? "legacy",
+    record.frequencia ?? 1,
+    record.duracao_segundos ?? null,
+    record.fonte_referencia ?? "",
+    record.observador ?? "",
+    record.atendimento_referencia ?? "",
   ];
 });
 if (activeRows.length) {
-  active.getRangeByIndexes(1, 0, activeRows.length, 13).values = activeRows;
-  styleData(active.getRangeByIndexes(1, 0, activeRows.length, 13));
+  active.getRangeByIndexes(1, 0, activeRows.length, 19).values = activeRows;
+  styleData(active.getRangeByIndexes(1, 0, activeRows.length, 19));
   active.getRange(`B2:B${activeRows.length + 1}`).format.numberFormat = "yyyy-mm-dd";
   active.getRange(`L2:L${activeRows.length + 1}`).format.numberFormat = "0%";
-  const table = active.tables.add(`A1:M${activeRows.length + 1}`, true, "AcontecimentosAtivosTable");
+  const table = active.tables.add(`A1:S${activeRows.length + 1}`, true, "AcontecimentosAtivosTable");
   table.style = "TableStyleMedium4";
   active.getRange(`B2:B${activeRows.length + 1}`).format.numberFormat = "yyyy-mm-dd";
 }
@@ -180,6 +187,7 @@ active.getRange("H:H").format.columnWidth = 30;
 active.getRange("I:K").format.columnWidth = 20;
 active.getRange("L:L").format.columnWidth = 18;
 active.getRange("M:M").format.columnWidth = 28;
+active.getRange("N:S").format.columnWidth = 26;
 
 const actionHeaders = [[
   "Data e hora da ação", "Ação", "Data e hora do acontecimento", "ID do intervalo",
@@ -194,7 +202,7 @@ const actionRows = (payload.actionLogs ?? []).map((log) => {
   return [
     excelLocalDateTime(log.criado_em),
     log.acao ?? "",
-    excelLocalDateTime(snapshot.data_hora),
+    snapshot.precisao_horario === "unknown" ? "Horário não informado" : snapshot.precisao_horario && snapshot.precisao_horario !== "second" ? `${saoPauloParts(snapshot.data_hora)?.year ?? ""}-${saoPauloParts(snapshot.data_hora)?.month ?? ""}-${saoPauloParts(snapshot.data_hora)?.day ?? ""} ${localTimeText(snapshot.data_hora).slice(0,5)}` : excelLocalDateTime(snapshot.data_hora),
     log.intervalo_id ?? "",
     snapshot.ambiente ?? "",
     snapshot.antecedente ?? "",
